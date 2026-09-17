@@ -631,6 +631,7 @@ type subagentEndpointView struct {
 	topP            *float64
 	maxTokens       *int
 	cachePrompt     *bool
+	toolChoice      *string
 	cacheControl    *bool
 	appTitle        *string
 }
@@ -753,6 +754,7 @@ func (a *App) resolveSubagentEndpointView(epName string) (subagentEndpointView, 
 			topP:            a.Client.TopP,
 			maxTokens:       a.Client.MaxTokens,
 			cachePrompt:     a.Client.CachePrompt,
+			toolChoice:      a.Client.ToolChoice,
 			cacheControl:    a.Client.CacheControl,
 			appTitle:        a.Client.AppTitle,
 		}
@@ -785,6 +787,7 @@ func (a *App) resolveSubagentEndpointView(epName string) (subagentEndpointView, 
 		topP:            ep.TopP,
 		maxTokens:       ep.MaxTokens,
 		cachePrompt:     ep.CachePrompt,
+		toolChoice:      ep.ToolChoice,
 		cacheControl:    ep.CacheControl,
 		appTitle:        ep.AppTitle,
 	}
@@ -1111,6 +1114,7 @@ func (a *App) dispatchSubagent(ctx context.Context, task string, progressOut io.
 		TopP:            view.topP,
 		MaxTokens:       view.maxTokens,
 		CachePrompt:     view.cachePrompt,
+		ToolChoice:      view.toolChoice,
 		CacheControl:    view.cacheControl,
 		AppTitle:        view.appTitle,
 		ChatID:          subChatID,
