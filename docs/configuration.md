@@ -74,10 +74,10 @@ Per-endpoint options: `auth_header` (verbatim `Authorization` value, beats
 the global `api_key`) and optional `temperature` / `top_p` / `max_tokens` /
 `tool_choice` — omitted from the request body entirely when unset, so server
 defaults stay authoritative. `tool_choice` is the OpenAI Chat Completions
-field sent verbatim (only on requests that carry tools); set it to `\"auto\"`
-for endpoints whose tool_choice default is `\"none\"` — e.g. IO Intelligence
+field sent verbatim (only on requests that carry tools); set it to `"auto"`
+for endpoints whose tool_choice default is `"none"` — e.g. IO Intelligence
 by io.net — so tool calls fire. The documented values are the OpenAI string
-forms (`\"auto\"`, `\"none\"`, `\"required\"`); the field is not
+forms (`"auto"`, `"none"`, `"required"`); the field is not
 validated — an empty string is sent as-is, like any other value. It is
 honoured by any endpoint kind that sends the shared Chat-Completions wire
 body. For `openai`-kind endpoints, `app_title`
