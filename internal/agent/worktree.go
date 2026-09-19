@@ -90,6 +90,14 @@ const worktreePrefix = "wakil-wt-"
 // enabling pruneStaleWorktrees to detect stale worktrees from crashed sessions.
 const worktreeOwnerFile = ".wakil-owner-pid"
 
+// pruneWorktreesTimeout is the maximum time allowed for stale worktree cleanup
+// at session start. Pruning is best-effort; in docker mode this bounds the
+// wall-clock time (RunShell honors ctx via exec.CommandContext). In direct
+// mode, ctx is checked between entries but cannot interrupt a single blocked
+// filesystem syscall (os.Stat, os.RemoveAll). On timeout, a warning is printed
+// and remaining stale worktrees are left for the next session's prune.
+const pruneWorktreesTimeout = 10 * time.Second
+
 // worktreeOpTimeout is the timeout for worktree diff/apply/cleanup operations.
 // These run after the child finishes and should not use the (possibly
 // cancelled) request context.
@@ -913,21 +921,46 @@ func isWorktreePath(path string, executor exec.Executor) bool {
 // Note: this does NOT invoke `git worktree prune` because it would also
 // prune user-created worktrees that happen to be missing from the
 // container's view.
+// pruneWarn prints a one-line notice when stale worktree cleanup is interrupted
+// by context cancellation (timeout or user-initiated). The message distinguishes
+// deadline-exceeded (timeout) from other cancellation causes so the user knows
+// whether this is expected (best-effort cleanup hit its budget) or unexpected
+// (the turn was cancelled). On a timeout, remaining stale worktrees are left
+// for the next session's prune to clean up.
+func pruneWarn(ctx context.Context, a *App) {
+	if ctx.Err() == nil {
+		return
+	}
+	if a.Out != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			fmt.Fprintf(a.Out, "· stale worktree cleanup timed out after %s — remaining entries deferred to next session\n", pruneWorktreesTimeout)
+		} else {
+			fmt.Fprintf(a.Out, "· stale worktree cleanup cancelled — remaining entries deferred to next session\n")
+		}
+	}
+}
+
 func pruneStaleWorktrees(ctx context.Context, a *App) {
 	if isDockerExecutor(a.Exec) {
 		pruneStaleDockerWorktreeMetadata(ctx, a)
 		return
 	}
 
-	// Direct mode: scan host temp dir.
-	_ = ctx
-	_ = a
+	// Direct mode: scan host temp dir. ctx is checked between entries so a
+	// timeout (pruneWorktreesTimeout) interrupts the scan between iterations.
+	// A single blocked filesystem syscall (os.Stat, os.RemoveAll) cannot be
+	// interrupted by ctx — the timeout bounds the number of entries, not each
+	// individual syscall.
 	tmpDir := os.TempDir()
 	entries, err := os.ReadDir(tmpDir)
 	if err != nil {
 		return
 	}
 	for _, entry := range entries {
+		if ctx.Err() != nil {
+			pruneWarn(ctx, a)
+			return
+		}
 		if !entry.IsDir() {
 			continue
 		}
@@ -1029,6 +1062,10 @@ func pruneStaleDockerWorktreeMetadata(ctx context.Context, a *App) {
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	for _, line := range lines {
+		if ctx.Err() != nil {
+			pruneWarn(ctx, a)
+			return
+		}
 		wtMetaDir := strings.TrimSpace(line)
 		if wtMetaDir == "" {
 			continue

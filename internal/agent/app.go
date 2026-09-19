@@ -1512,10 +1512,20 @@ func (a *App) ensurePreamble() {
 	}
 
 	// Prune stale worktrees from previous (possibly crashed) sessions.
-	// Runs on the first turn of a new session (when preambleDay is empty).
+	// Runs on the first turn of a new session (when preambleDay is empty) and
+	// after every NewConversation reset (which clears preambleDay).
+	// Bounded timeout: prune is best-effort cleanup on the turn's critical path.
+	// context.Background() with no timeout could hang the first turn if git or
+	// the filesystem is slow. The 10s ceiling bounds the wall-clock time in
+	// docker mode (RunShell honors ctx); in direct mode it bounds the number of
+	// entries processed (individual syscalls can't be interrupted). Derived
+	// from Background() rather than the turn ctx so pruning is independent of
+	// turn cancellation — best-effort cleanup should complete even if the user
+	// aborts the turn.
 	if a.preambleDay == "" {
-		// First turn this session — prune.
-		pruneStaleWorktrees(context.Background(), a)
+		pruneCtx, pruneCancel := context.WithTimeout(context.Background(), pruneWorktreesTimeout)
+		pruneStaleWorktrees(pruneCtx, a)
+		pruneCancel()
 	}
 
 	text := a.buildPreamble(today)
