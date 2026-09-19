@@ -102,13 +102,67 @@ func (s SubagentSummary) Render() string {
 		if len(b) <= 4000 {
 			return string(b)
 		}
+		// Trim less-critical arrays before findings: checked, skipped,
+		// spill_refs, external_calls, files_changed. Findings are the most
+		// valuable — keep them as long as possible.
+		if len(s.Checked) > 0 {
+			s.Checked = s.Checked[:len(s.Checked)-1]
+			continue
+		}
+		if len(s.Skipped) > 0 {
+			s.Skipped = s.Skipped[:len(s.Skipped)-1]
+			continue
+		}
+		if len(s.SpillRefs) > 0 {
+			s.SpillRefs = s.SpillRefs[:len(s.SpillRefs)-1]
+			continue
+		}
+		if len(s.ExternalCalls) > 0 {
+			s.ExternalCalls = s.ExternalCalls[:len(s.ExternalCalls)-1]
+			continue
+		}
+		if len(s.FilesChanged) > 0 {
+			s.FilesChanged = s.FilesChanged[:len(s.FilesChanged)-1]
+			continue
+		}
 		if len(s.Findings) > 1 {
 			s.Findings = s.Findings[:len(s.Findings)-1]
 			continue
 		}
-		// Cannot trim further — hard truncate (rare: even a single finding is >4k).
-		return string(b[:3997]) + "…"
+		// Cannot trim further — emit a minimal valid JSON object instead
+		// of truncating bytes (which would produce invalid JSON).
+		return `{"objective":"` + escapeJSONString(s.Objective) + `","status":"incomplete","findings":[{"summary":"summary truncated — too large for 4k limit","location":"","kind":"error","weight":"low"}],"uncertainty":["render overflow — full summary could not be rendered within 4000 chars"]}`
 	}
+}
+
+// escapeJSONString escapes a string for safe embedding inside a JSON string
+// literal (used by Render's fallback path which builds JSON manually).
+func escapeJSONString(s string) string {
+	if s == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range s {
+		switch r {
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			if r < 0x20 {
+				fmt.Fprintf(&b, `\u%04x`, r)
+			} else {
+				b.WriteRune(r)
+			}
+		}
+	}
+	return b.String()
 }
 
 // subagentSystemPrompt instructs the subagent to emit only a SubagentSummary JSON.

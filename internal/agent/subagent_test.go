@@ -181,6 +181,65 @@ func TestSubagentSummaryRenderCap(t *testing.T) {
 	}
 }
 
+// TestSubagentSummaryRenderSingleFindingOverflow verifies that Render()
+// produces valid JSON even when a single finding exceeds the 4000-char
+// limit — the old fallback was string(b[:3997])+"…" which is invalid JSON.
+func TestSubagentSummaryRenderSingleFindingOverflow(t *testing.T) {
+	s := SubagentSummary{
+		Objective: "test overflow",
+		Findings: []Finding{
+			{
+				Summary:  strings.Repeat("x", 5000), // single finding > 4000 chars
+				Location: "file.go:1",
+				Kind:     "match",
+				Weight:   "high",
+			},
+		},
+	}
+	rendered := s.Render()
+	if len(rendered) > 4000 {
+		t.Errorf("Render() = %d chars, want ≤4000", len(rendered))
+	}
+	var check SubagentSummary
+	if err := json.Unmarshal([]byte(rendered), &check); err != nil {
+		t.Errorf("Render() is not valid JSON: %v\n%s", err, rendered[:min(len(rendered), 200)])
+	}
+	if check.Status != "incomplete" {
+		t.Errorf("status = %q, want 'incomplete' on overflow", check.Status)
+	}
+	if len(check.Findings) == 0 {
+		t.Error("expected at least one finding in overflow fallback")
+	}
+}
+
+// TestSubagentSummaryRenderTrimsCheckedBeforeFindings verifies that
+// Render() trims less-critical arrays (checked, skipped, etc.) before
+// trimming findings — findings are the most valuable.
+func TestSubagentSummaryRenderTrimsCheckedBeforeFindings(t *testing.T) {
+	s := SubagentSummary{
+		Objective: "test trim order",
+		Findings: []Finding{
+			{Summary: "important finding", Location: "a.go:1", Kind: "match", Weight: "high"},
+		},
+		Checked: make([]CheckedItem, 50), // lots of checked entries to trim
+	}
+	for i := range s.Checked {
+		s.Checked[i] = CheckedItem{Path: "file" + string(rune('a'+i%26)) + ".go", SizeK: 100, Status: "full"}
+	}
+	rendered := s.Render()
+	var check SubagentSummary
+	if err := json.Unmarshal([]byte(rendered), &check); err != nil {
+		t.Errorf("Render() is not valid JSON: %v", err)
+	}
+	// The finding should survive (checked entries were trimmed first).
+	if len(check.Findings) == 0 {
+		t.Error("expected findings to survive when checked entries are trimmed")
+	}
+	if check.Findings[0].Summary != "important finding" {
+		t.Errorf("finding summary = %q, want 'important finding'", check.Findings[0].Summary)
+	}
+}
+
 // --- Test 5: NoMemoryWrite=true on subagent's client ---
 
 func TestDispatchSubagentNoMemoryWrite(t *testing.T) {
