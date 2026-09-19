@@ -636,23 +636,27 @@ You have async work in flight. What should you do?
     - Edit (capability: "edit"): can read AND edit files — edit_file,
       write_file, delete_file, move_file. Gated on /auto (or --auto in
       headless runs — session write consent); rejected without it, never
-      silently downgraded. In a git repo with a DirectExecutor, edit-tier
-      children run in isolated git worktrees — each child gets its own
-      working directory, and changes are applied back as patches (one at a
-      time). This allows parallel edit dispatch. In a non-git directory or
-      with DockerExecutor, edit children fall back to serialized execution
-      (one at a time) with a warning. Discovery children always parallelize
-      freely, including alongside edit children.
-      Important: worktree-mode children see the committed HEAD state, NOT
-      the parent's uncommitted working tree. If you've made edits in the
-      current session (including patches from earlier sibling children),
-      those changes are invisible to the child and may cause its patch to
-      conflict. Overlapping or incompatible changes to the same file will
-      conflict; disjoint changes apply cleanly. A conflicting child's work
-      is discarded and reported in uncertainty[]. Incomplete/timed-out
-      children's partial patches are still applied (no auto-restore in
-      worktree mode). The child never prompts — consent was established at
-      session level.
+      silently downgraded. In a git repo, edit-tier children run in isolated
+      git worktrees — each child gets its own working directory, and changes
+      are applied back as patches (one at a time). This allows parallel edit
+      dispatch. In a non-git directory or with DockerExecutor, edit children
+      fall back to serialized execution (one at a time) with a warning.
+      Discovery children always parallelize freely, including alongside edit
+      children.
+      The worktree baseline is the parent's current working tree (tracked +
+      non-ignored untracked files), NOT just HEAD — the child sees your
+      uncommitted changes and non-ignored untracked files. The child's patch
+      contains ONLY its own delta; a no-op child produces an empty patch even
+      when the parent is dirty. Overlapping or incompatible changes to the same
+      file will conflict; disjoint changes apply cleanly. A conflicting child's
+      work is discarded and reported in uncertainty[]. Incomplete/timed-out
+      children's partial patches are still applied (no auto-restore in worktree
+      mode). The child never prompts — consent was established at session level.
+      After the child finishes, a verification command (default: go build ./...
+      for Go projects) runs inside the worktree — failures are reported as a
+      high-weight finding but do not block the patch (advisory, non-blocking).
+      The child cannot run shell commands itself; verification runs on the
+      parent side.
     - Tools (capability: "tools"): adds MCP tools (from the SubagentMCPServers
       allowlist), LSP tools, and web search to the discovery set. Gated on
       /auto. Mutating MCP calls are serialized per server.
