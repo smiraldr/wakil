@@ -63,7 +63,7 @@ func TestDispatchSubagentParentCtxIsolated(t *testing.T) {
 	// Async discovery routing: the placeholder is the tool result; the real
 	// summary arrives via the async envelope. Await the worker + drain.
 	waitAsyncOps(t, app)
-	env := app.drainAsyncInbox()
+	env := drainAsyncEnvelope(app)
 
 	// Parent Conv must NOT contain raw file content (context isolation held).
 	for _, m := range app.Conv {

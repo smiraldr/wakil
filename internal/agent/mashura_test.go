@@ -639,6 +639,33 @@ func waitAsyncOps(t *testing.T, app *App) {
 	}
 }
 
+// drainAsyncEnvelope retrieves the async envelope for completed subagent
+// ops, handling the race where the turn loop's own drainAsyncInbox (at
+// the top of streamTurn) already consumed the inbox and delivered the
+// envelope into a.Conv as a user message. It first checks the inbox
+// (the undelivered case), then scans Conv for the async block header
+// (the already-delivered case). Returns the envelope text or "" if
+// nothing was found.
+func drainAsyncEnvelope(app *App) string {
+	// Try the inbox first — the turn loop may not have drained it yet.
+	if env := app.drainAsyncInbox(); env != "" {
+		return env
+	}
+	// The turn loop already drained the inbox and delivered the envelope
+	// into a.Conv as a user message. Scan for it.
+	app.convMu.RLock()
+	defer app.convMu.RUnlock()
+	for _, m := range app.Conv {
+		if m.Role == "user" {
+			s := DerefStr(m.Content)
+			if strings.Contains(s, asyncBlockHeader) {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
 // Cost tracker records each panel member's usage under its own per-model row
 // "mashura·<model>", so billing is split by model (P30).
 func TestPanelCostPerModel(t *testing.T) {

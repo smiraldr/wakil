@@ -147,7 +147,7 @@ func TestParallelBlockRunsConcurrently(t *testing.T) {
 	// Envelope carries BOTH structured summaries (delivered next turn); the
 	// barrier above already proved the two workers overlapped.
 	waitAsyncOps(t, app)
-	env := app.drainAsyncInbox()
+	env := drainAsyncEnvelope(app)
 	if !strings.Contains(env, "TASK-A") || !strings.Contains(env, "TASK-B") {
 		t.Errorf("async envelope missing both tasks: %q", env)
 	}
@@ -341,7 +341,7 @@ func TestParallelBlockExhaustionSurfaced(t *testing.T) {
 
 	// Async delivery: the envelope carries each child's structured summary.
 	waitAsyncOps(t, app)
-	env := app.drainAsyncInbox()
+	env := drainAsyncEnvelope(app)
 	if !strings.Contains(env, `"status":"incomplete"`) {
 		t.Errorf("async envelope should carry incomplete status; got %q", env)
 	}
@@ -377,7 +377,7 @@ func TestBatchToolAggregatesInOrder(t *testing.T) {
 
 	// The delivered envelope carries both children's summaries, in aggregate.
 	waitAsyncOps(t, app)
-	env := app.drainAsyncInbox()
+	env := drainAsyncEnvelope(app)
 	if !strings.Contains(env, "TASK-A") || !strings.Contains(env, "TASK-B") {
 		t.Errorf("async envelope missing both tasks in order: %q", env)
 	}

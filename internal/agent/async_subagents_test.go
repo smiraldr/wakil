@@ -65,9 +65,10 @@ func TestAsyncDiscoveryDeliversExactlyOnce(t *testing.T) {
 		}
 	}
 
-	// Exactly-once delivery: one envelope, then empty.
+	// Exactly-once delivery: one envelope (either from the inbox or
+	// already delivered into Conv by the turn loop), then empty.
 	waitAsyncOps(t, app)
-	env := app.drainAsyncInbox()
+	env := drainAsyncEnvelope(app)
 	if !strings.Contains(env, "TASK-A") || !strings.Contains(env, "TASK-B") {
 		t.Fatalf("envelope missing tasks: %q", env)
 	}
