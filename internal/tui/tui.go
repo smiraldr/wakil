@@ -408,6 +408,29 @@ type tuiModel struct {
 	// "awaiting input" instead of silent idle.
 	hadTurn bool
 
+	// refreshDirty marks that the streaming tail has grown since the last
+	// refreshViewport() call. Delta handlers (KindMessageDelta,
+	// KindReasoningDelta) set this and arm a refresh tick instead of calling
+	// refreshViewport() synchronously — throttling the O(tail) per-chunk work
+	// (wrapAnsi, ansi.Strip, lipgloss render, strings.Split) to ~30fps.
+	// refreshViewport() clears it. All non-delta callers (addItem, reflow,
+	// flushStreaming, approval, rotation, etc.) call refreshViewport() directly,
+	// which both renders immediately and clears the dirty flag.
+	refreshDirty bool
+	// refreshArmed guards the refresh tick against duplicate chains, following
+	// the same pattern as dotArmed. Set true when a tick is armed; cleared by
+	// the tick handler. Direct refreshViewport() calls do NOT clear this — the
+	// outstanding tick arrives, finds refreshDirty=false, and becomes a no-op
+	// (clearing refreshArmed). This avoids the "disarming is not cancellation"
+	// problem: a previously scheduled tea.Tick cannot be cancelled, but with
+	// refreshDirty as the gate, a stale tick is harmless.
+	refreshArmed bool
+	// refreshSeq is a generation counter for stale-tick protection across turn
+	// boundaries. Each armed tick captures the current seq; the tick handler
+	// rejects mismatches. clearWiringTurnState increments it so a tick armed
+	// during turn A cannot clear refreshArmed or render during turn B.
+	refreshSeq int
+
 	// Input history for UP/DOWN navigation (most-recent entry first).
 	// Extracted to history_model.go (WP-6.6); embedded so selector access is unchanged.
 	historyModel
@@ -1914,6 +1937,42 @@ func isDownwardScroll(msg tea.Msg) bool {
 	return false
 }
 
+// refreshTickInterval is the throttle interval for streaming-delta viewport
+// refreshes. Delta handlers (KindMessageDelta, KindReasoningDelta) defer the
+// viewport render by this duration instead of calling refreshViewport()
+// synchronously. At ~30fps this coalesces per-chunk tail renders (wrapAnsi,
+// ansi.Strip, lipgloss render, strings.Split — each O(tail length)) into
+// one render per 33ms, reducing the cumulative refresh cost on long responses.
+const refreshTickInterval = 33 * time.Millisecond
+
+// refreshTickMsg is the deferred viewport refresh message. It is armed by
+// refreshViewportThrottled() and handled in handleEventMsg. The seq field
+// matches the m.refreshSeq generation at arm time; a mismatch means the tick
+// is stale (from a prior turn) and is discarded without touching flags.
+type refreshTickMsg struct{ seq int }
+
+// refreshViewportThrottled defers a viewport refresh by refreshTickInterval.
+// Called by streaming delta handlers (KindMessageDelta, KindReasoningDelta)
+// to coalesce expensive per-chunk tail renders. Sets refreshDirty and arms
+// a single tick (re-uses an outstanding tick if one is pending). Returns a
+// tea.Cmd to be appended to the event handler's cmd list.
+//
+// All other callers (addItem, reflow, flushStreaming, approval, rotation,
+// turn completion, etc.) call refreshViewport() directly, which renders
+// immediately and clears refreshDirty. A pending tick that arrives after a
+// direct refresh finds refreshDirty=false and becomes a no-op.
+func (m *tuiModel) refreshViewportThrottled() tea.Cmd {
+	m.refreshDirty = true
+	if m.refreshArmed {
+		return nil // tick already pending — it will pick up the dirty flag
+	}
+	m.refreshArmed = true
+	seq := m.refreshSeq
+	return tea.Tick(refreshTickInterval, func(time.Time) tea.Msg {
+		return refreshTickMsg{seq: seq}
+	})
+}
+
 // refreshViewport re-renders the viewport. It separates committed items from the
 // live streaming tail so that per-chunk updates only re-render the tail —
 // O(chunk) rather than O(full transcript). The committed prefix is rebuilt only
@@ -1921,8 +1980,18 @@ func isDownwardScroll(msg tea.Msg) bool {
 func (m *tuiModel) refreshViewport() {
 	w := m.vp.Width
 	if w <= 0 {
+		// Clear dirty even on early return: a zero-width viewport can't render,
+		// but leaving dirty set would cause the tick handler to re-arm
+		// indefinitely (no progress possible until a resize). The resize
+		// (WindowSizeMsg → reflow) will rebuild the viewport from the
+		// streaming builder, so the content is not lost.
+		m.refreshDirty = false
 		return
 	}
+
+	// Clear the dirty flag: a pending refresh tick that arrives after this
+	// refresh will find refreshDirty=false and become a no-op.
+	m.refreshDirty = false
 
 	// --- committed prefix ---
 	if m.prefixDirty || m.prefixW != w {

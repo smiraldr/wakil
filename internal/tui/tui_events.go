@@ -76,6 +76,20 @@ func (m tuiModel) handleEventMsg(msg tea.Msg, cmds []tea.Cmd) (tuiModel, []tea.C
 			m.dotArmed = false
 		}
 		return m, cmds, true
+	case refreshTickMsg:
+		// Deferred viewport refresh (throttled streaming deltas). Reject
+		// stale ticks from a prior turn (seq mismatch). If dirty, render
+		// now; otherwise the tick is a no-op (a direct refreshViewport
+		// already rendered). Clear refreshArmed so the next delta can arm
+		// a fresh tick.
+		if lm.seq != m.refreshSeq {
+			return m, cmds, true // stale tick — discard without touching flags
+		}
+		m.refreshArmed = false
+		if m.refreshDirty {
+			m.refreshViewport()
+		}
+		return m, cmds, true
 	case armTickMsg:
 		// Clear the arm only if this tick belongs to the current arm and the
 		// deadline has actually passed.
@@ -361,12 +375,16 @@ func (m tuiModel) handleEventMsg(msg tea.Msg, cmds []tea.Cmd) (tuiModel, []tea.C
 			m.addItem(iDiag, dim2(sprint("· thought (~%d tokens)", toks)))
 		}
 		m.streaming.WriteString(p.Text)
-		m.refreshViewport()
+		if cmd := m.refreshViewportThrottled(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 
 	case event.KindReasoningDelta:
 		p := ev.Payload.(event.ReasoningDelta)
 		m.reasoning.WriteString(p.Text)
-		m.refreshViewport()
+		if cmd := m.refreshViewportThrottled(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 
 	case event.KindTokRate:
 		p := ev.Payload.(event.TokRate)
@@ -652,6 +670,13 @@ func (m tuiModel) clearWiringTurnState() tuiModel {
 	m.flushOnCancel = false
 	m.pendApproval = nil // safety: a lost ApprovalResolved must not wedge the gate
 	m.clearArm()
+	// Disarm any pending refresh tick — the final flushStreaming() above
+	// already called refreshViewport() directly, clearing refreshDirty.
+	// Increment refreshSeq so a stale tick armed during this turn is
+	// rejected by the seq check in the refreshTickMsg handler.
+	m.refreshArmed = false
+	m.refreshDirty = false
+	m.refreshSeq++
 	// Cancel any running side question at turn end (same policy as the old
 	// path); its Done event renders the output and cleans up.
 	if m.sideQuestionCancel != nil {
