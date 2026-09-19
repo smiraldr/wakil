@@ -719,6 +719,12 @@ func NewDockerExecutor(opts DockerOpts) (*DockerExecutor, error) {
 			fmt.Fprintf(os.Stderr, "warning: mkdir workdir %s: %s: %v\n", workdir, strings.TrimSpace(out), err)
 		}
 	}
+
+	// ensurePasswdEntry runs before the parallel block. The /etc tmpfs is
+	// size-limited (1 MiB); running passwd concurrently with restoreEtcBackups
+	// could convert a benign ENOSPC ordering (restore fails → warning) into a
+	// nondeterministic fatal (passwd fails → teardown under signing). Keeping
+	// passwd sequential preserves the existing failure semantics.
 	if uid := os.Getuid(); uid > 0 {
 		if err := ensurePasswdEntry(name, uid, os.Getgid()); err != nil {
 			if opts.Signing.Enabled {
@@ -733,12 +739,75 @@ func NewDockerExecutor(opts DockerOpts) (*DockerExecutor, error) {
 			fmt.Fprintf(os.Stderr, "warning: %v\n", err)
 		}
 	}
-	if err := restoreEtcBackups(name); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: %v\n", err)
+
+	// Parallelize the remaining independent startup probes. Each goroutine
+	// writes only its own result variable; warnings are printed by the parent
+	// in a fixed order after wg.Wait() to keep output deterministic.
+	//
+	// Goroutine A: restoreEtcBackups — docker exec -u 0, writes /etc/ssl/certs,
+	//   /etc/chromium.d, /etc/alternatives. Independent of passwd (already done)
+	//   and of ensureDockerCLI (which uses docker cp from the host, not TLS).
+	// Goroutine B: ensureDockerCLI → checkInContainerDockerSocket (chained:
+	//   the socket check runs `docker info` inside the container and needs the
+	//   docker binary that ensureDockerCLI installs). The socket check runs
+	//   even if ensureDockerCLI fails — it may still succeed if docker was
+	//   pre-installed in the image.
+	// Goroutine C: waitForKVR — host-side UDS socket ping (not a docker exec).
+	//   Overlapping the kvr polling window with the exec calls is the primary
+	//   latency win. Note: kvr's 5s window now starts from container start
+	//   rather than after exec calls complete — a narrow edge case where the
+	//   server takes 5–5.2s to bind could flip from success to timeout.
+	const kvrTimeout = 5 * time.Second
+
+	var (
+		restoreErr     error
+		dockerCLIErr   error
+		dockerSockWarn string
+		kvrErr         error
+		kvrLogs        string
+	)
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		restoreErr = restoreEtcBackups(name)
+	}()
+
+	if dockerSock {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			dockerCLIErr = ensureDockerCLI(name)
+			// checkInContainerDockerSocket runs regardless of ensureDockerCLI
+			// failure — the docker binary may already be present in the image.
+			dockerSockWarn = checkInContainerDockerSocket(name)
+		}()
+	}
+
+	if kvrEnabled {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			kvrErr = waitForKVR(filepath.Join(opts.StagingMount, "kvr.sock"), kvrTimeout)
+			if kvrErr != nil {
+				// Fetch container logs inside the goroutine to help diagnose
+				// why kvr-server didn't start — the entrypoint.sh has no error
+				// checking, so a crash is only visible in docker logs.
+				kvrLogs = getContainerLogs(name, 20)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// Process results in fixed order for deterministic warning output.
+	if restoreErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: %v\n", restoreErr)
 	}
 	if dockerSock {
-		if err := ensureDockerCLI(name); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: %v (docker socket mounted but CLI unavailable)\n", err)
+		if dockerCLIErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: %v (docker socket mounted but CLI unavailable)\n", dockerCLIErr)
 		}
 		// Check that the in-container docker CLI can actually reach the host
 		// daemon via the bind-mounted socket. On SELinux-Enforcing hosts, the
@@ -746,8 +815,8 @@ func NewDockerExecutor(opts DockerOpts) (*DockerExecutor, error) {
 		// container_runtime_t) even though DAC (group-add) is correct. This
 		// surfaces the denial as an actionable warning instead of a silent
 		// failure when the agent first tries to use docker.
-		if warn := checkInContainerDockerSocket(name); warn != "" {
-			fmt.Fprintf(os.Stderr, "warning: %s\n", warn)
+		if dockerSockWarn != "" {
+			fmt.Fprintf(os.Stderr, "warning: %s\n", dockerSockWarn)
 		}
 	}
 
@@ -755,17 +824,11 @@ func NewDockerExecutor(opts DockerOpts) (*DockerExecutor, error) {
 	// the socket path. On failure, warn and continue (kvr is an enhancement,
 	// not a hard dependency — staging tools report "staging unavailable").
 	if kvrEnabled {
-		kvrSocket := filepath.Join(opts.StagingMount, "kvr.sock")
-		d.kvrSocket = kvrSocket
-		const kvrTimeout = 5 * time.Second
-		if err := waitForKVR(kvrSocket, kvrTimeout); err != nil {
-			// Fetch container logs to help diagnose why kvr-server didn't
-			// start — the entrypoint.sh has no error checking, so a crash
-			// is only visible in docker logs.
-			logs := getContainerLogs(name, 20)
-			msg := fmt.Sprintf("kvr: staging store not ready after %s — staging tools disabled. KVR requires the wakil Docker image with entrypoint.sh and kvr-server. Set kvr_disabled:true or exec_mode:\"direct\" if running outside Docker. Error: %v", kvrTimeout, err)
-			if logs != "" {
-				msg += "\nContainer logs (last 20 lines):\n" + logs
+		d.kvrSocket = filepath.Join(opts.StagingMount, "kvr.sock")
+		if kvrErr != nil {
+			msg := fmt.Sprintf("kvr: staging store not ready after %s — staging tools disabled. KVR requires the wakil Docker image with entrypoint.sh and kvr-server. Set kvr_disabled:true or exec_mode:\"direct\" if running outside Docker. Error: %v", kvrTimeout, kvrErr)
+			if kvrLogs != "" {
+				msg += "\nContainer logs (last 20 lines):\n" + kvrLogs
 			}
 			fmt.Fprintf(os.Stderr, "%s\n", msg)
 			d.kvrSocket = ""
