@@ -1129,6 +1129,22 @@ func (a *App) WarnContextPressure() {
 // is reached; tools are dropped for that turn so the model must answer with this.
 const ToolLimitPrompt = "You have reached the tool-call limit for this turn. Stop calling tools and produce your final response now, using only the information you already have."
 
+// BudgetExhaustedPrompt is injected when the per-turn tool-output budget is
+// exhausted and the grace window has expired. It tells the subagent to stop
+// calling tools and produce its JSON summary with whatever evidence it has.
+// This is distinct from ToolLimitPrompt (iteration cap) so the child knows
+// WHY it is being stopped (content was stubbed, not iteration limit reached).
+const BudgetExhaustedPrompt = "The per-turn tool-output budget is exhausted — further tool calls will return only spill pointers. Stop calling tools and produce your JSON summary now, using only the information you already have. List any files you could not fully examine in skipped[] with reason: budget-exhausted."
+
+// stopOnStubGrace is the number of additional tool-enabled iterations a
+// subagent gets after turnBudgetStubbed first fires before the loop
+// force-finishes. 2 means: the model sees stubbed results for iter s, gets
+// tool-enabled streams at s+1 and s+2 (to read spill paths or rephrase),
+// then a tools-stripped wrap-up at s+3. This prevents the child from
+// burning the remaining 25+ iterations receiving stubs and re-requesting
+// the same content. Subagent-only (gated on IsSubagent).
+const stopOnStubGrace = 2
+
 // confinementBreakerThreshold is how many times the SAME path may fail path
 // confinement (ConfinePath: outside workspace / unresolvable) within one turn
 // before the circuit breaker trips and force-finishes the turn early.

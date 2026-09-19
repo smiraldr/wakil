@@ -38,6 +38,7 @@ func (a *App) prepareTurn() {
 	a.exhausted = false
 	a.stopReason = ""
 	a.turnBudgetStubbed = false
+	a.turnBudgetStubbedIter = -1
 	// NOTE: budgetExhausted is NOT reset here — it's session-scoped. Once
 	// the budget is breached, all subsequent turns are force-finished
 	// immediately to prevent further spending.
@@ -178,14 +179,53 @@ func (a *App) streamTurn(ctx context.Context, userText string, rsink proxy.Sink,
 			a.convMu.Unlock()
 			fmt.Fprintln(a.Out, Dim("· async results delivered"))
 		}
+		// Subagent budget visibility: inject a per-iteration budget snapshot
+		// as a user message at the loop top, so the child LLM can steer itself.
+		// Only for subagents (the parent has human-level steering). Only when
+		// TurnToolBudget > 0 and MaxToolIterations > 0 (both must be set for
+		// the footer to be meaningful). Skipped on iter 0 (no budget consumed
+		// yet, no point cluttering the first request). The message is NOT
+		// appended to tool-result content — it's a standalone user message,
+		// following the existing ToolLimitPrompt/confinementBreaker pattern.
+		// RawTools bypasses CapOrStub, so budget state may be misleading —
+		// skip the footer when RawTools is on. Read RawTools under stateMu.RLock
+		// for consistency with the result-finalization path.
+		a.stateMu.RLock()
+		rawToolsForBudget := a.RawTools
+		a.stateMu.RUnlock()
+		if a.IsSubagent && iter > 0 && a.Cfg.MaxToolIterations > 0 && a.Cfg.TurnToolBudget > 0 && !rawToolsForBudget {
+			budgetLeft := a.Cfg.TurnToolBudget - turnToolBytes
+			if budgetLeft < 0 {
+				budgetLeft = 0
+			}
+			itersRemaining := a.Cfg.MaxToolIterations - iter
+			if itersRemaining < 0 {
+				itersRemaining = 0
+			}
+			budgetMsg := fmt.Sprintf("[budget: %d tool rounds left · tool output %dk/%dk left]",
+				itersRemaining, budgetLeft/1000, a.Cfg.TurnToolBudget/1000)
+			// Wrap-up warning at ≤5 iterations remaining or <15% budget remaining.
+			if itersRemaining <= 5 || budgetLeft < a.Cfg.TurnToolBudget*15/100 {
+				budgetMsg = "⚠ Budget low — produce the JSON summary now with what you have.\n" + budgetMsg
+			}
+			a.convMu.Lock()
+			a.Conv = append(a.Conv, proxy.Message{Role: "user", Content: StrPtr(budgetMsg)})
+			a.convMu.Unlock()
+		}
 		// Hard backstop against runaway tool loops: on the final allowed iteration
 		// drop the tools and force the model to answer from what it already has.
 		// 0 = unlimited (the parent's default; a human gates each tool there).
-		forceFinish := (a.Cfg.MaxToolIterations > 0 && iter >= a.Cfg.MaxToolIterations) || confinementTrip
+		// Stop-on-stub: once the turn tool budget is exhausted (turnBudgetStubbed),
+		// allow at most stopOnStubGrace additional tool-enabled iterations, then
+		// force-finish. Subagent-only (gated on IsSubagent) — the parent has
+		// human-level steering and MaxToolIterations==0 by default.
+		stopOnStub := a.IsSubagent && a.turnBudgetStubbed && a.turnBudgetStubbedIter >= 0 &&
+			iter >= a.turnBudgetStubbedIter+stopOnStubGrace+1
+		forceFinish := (a.Cfg.MaxToolIterations > 0 && iter >= a.Cfg.MaxToolIterations) || confinementTrip || stopOnStub
 		tools := a.Tools
 		if forceFinish {
 			tools = nil
-			a.exhausted = true // signal to dispatchSubagent: iteration limit hit
+			a.exhausted = true // signal to dispatchSubagent: turn ended forcibly
 			if confinementTrip {
 				// Precise, honest wrap-up: name the unreachable path(s) instead of
 				// the generic ToolLimitPrompt, and record the reason so
@@ -196,6 +236,14 @@ func (a *App) streamTurn(ctx context.Context, userText string, rsink proxy.Sink,
 				a.stopReason = "confinement_breaker"
 				a.convMu.Lock()
 				a.Conv = append(a.Conv, proxy.Message{Role: "user", Content: StrPtr(confinementBreakerPrompt(confinementPaths))})
+				a.convMu.Unlock()
+			} else if stopOnStub {
+				// Stop-on-stub: the per-turn tool-output budget was exhausted and
+				// the grace window expired. Dedicated stop reason so the parent
+				// knows this was budget exhaustion, not iteration limit.
+				a.stopReason = "turn_budget_exhausted"
+				a.convMu.Lock()
+				a.Conv = append(a.Conv, proxy.Message{Role: "user", Content: StrPtr(BudgetExhaustedPrompt)})
 				a.convMu.Unlock()
 			} else {
 				a.stopReason = "iteration_limit"
@@ -364,6 +412,12 @@ func (a *App) streamTurn(ctx context.Context, userText string, rsink proxy.Sink,
 			a.stateMu.RUnlock()
 			if !rawTools {
 				text = a.CapOrStub(text, tc.Function.Name, turnToolBytes)
+			}
+			// Track the first iteration where turnBudgetStubbed fires, for the
+			// stop-on-stub grace window. First stub wins (sentinel -1 = not yet).
+			// Only meaningful for subagents; the parent has MaxToolIterations==0.
+			if a.turnBudgetStubbed && a.turnBudgetStubbedIter < 0 {
+				a.turnBudgetStubbedIter = iter
 			}
 			if a.Trace != nil {
 				*traceToolCalls = append(*traceToolCalls, trace.ToolTrace{

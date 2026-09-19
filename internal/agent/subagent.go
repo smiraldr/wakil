@@ -180,11 +180,13 @@ Rules:
 // extractJSON strips markdown fences and extracts the outermost {...} object from s.
 
 // mergeStopReason picks the highest-priority stop reason from two Send runs
-// (first Send + retry Send). Precedence: hard_max_shed > iteration_limit.
-// Confinement is handled separately by the caller (it always wins). Empty
-// strings are ignored. When both are the same or one is empty, the non-empty
-// one wins. When they differ, hard_max_shed takes priority — it means content
-// was lost, which is strictly worse than merely running out of iterations.
+// (first Send + retry Send). Precedence:
+//   confinement (handled by caller, always wins) > hard_max_shed >
+//   turn_budget_exhausted > iteration_limit.
+// Empty strings are ignored. When both are the same or one is empty, the
+// non-empty one wins. hard_max_shed (content lost) is strictly worse than
+// turn_budget_exhausted (content stubbed but recoverable), which is worse
+// than iteration_limit (ran out of rounds but content was intact).
 func mergeStopReason(first, retry string) string {
 	if first == retry {
 		return first // same or both empty
@@ -195,9 +197,12 @@ func mergeStopReason(first, retry string) string {
 	if retry == "" {
 		return first
 	}
-	// Differ and both non-empty: hard_max_shed > iteration_limit.
+	// Differ and both non-empty: hard_max_shed > turn_budget_exhausted > iteration_limit.
 	if first == "hard_max_shed" || retry == "hard_max_shed" {
 		return "hard_max_shed"
+	}
+	if first == "turn_budget_exhausted" || retry == "turn_budget_exhausted" {
+		return "turn_budget_exhausted"
 	}
 	return first // fallback: first-wins for any future reason pair
 }

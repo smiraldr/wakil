@@ -16,18 +16,25 @@ type subagentState struct {
 	exhausted bool
 
 	// stopReason records why the subagent stopped, set at the exact site where
-	// exhaustion occurs. Values: "iteration_limit", "hard_max_shed",
-	// "confinement_breaker". Empty = no stop reason (normal completion).
-	// Captured before the retry Send (which resets it) and ORed across both
-	// Sends, exactly like exhausted. Only meaningful for subagents.
+	// exhaustion occurs. Values: "iteration_limit", "turn_budget_exhausted",
+	// "hard_max_shed", "confinement_breaker". Empty = no stop reason (normal
+	// completion). Captured before the retry Send (which resets it) and ORed
+	// across both Sends, exactly like exhausted. Only meaningful for subagents.
 	stopReason string
 
-	// turnBudgetStubbed is a sticky per-App flag set inside CapOrStub when the
-	// per-turn tool budget is exhausted and a result is stubbed to a spill
-	// pointer. Used by dispatchSubagent to set StopReason="turn_budget_exhausted"
-	// when no other stop reason fired (the model may stop naturally after being
-	// starved of content, without hitting the iteration cap).
+	// turnBudgetStubbed is a per-Send flag (reset in prepareTurn) set inside
+	// CapOrStub when the per-turn tool budget is exhausted and a result is
+	// stubbed to a spill pointer. Used by streamTurn to force-finish the turn
+	// after a short grace window (stopOnStubGrace), and by dispatchSubagent to
+	// set StopReason="turn_budget_exhausted" when no other stop reason fired.
 	turnBudgetStubbed bool
+
+	// turnBudgetStubbedIter records the streamTurn iteration at which
+	// turnBudgetStubbed first transitioned to true. -1 = not yet stubbed.
+	// Set once (first stub wins); used by the stop-on-stub grace logic to
+	// allow exactly stopOnStubGrace additional tool-enabled iterations before
+	// forcing finish. Per-Send (reset alongside turnBudgetStubbed).
+	turnBudgetStubbedIter int
 
 	// filesChanged is the recorder for edit-tier subagents: tracks canonical
 	// paths touched by successful edit-category tool calls during the child's
