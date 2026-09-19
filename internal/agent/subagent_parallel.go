@@ -448,7 +448,7 @@ func (a *App) finalizeSubagentBlock(jobs []subagentJob, results []subagentJobRes
 			ChatID:       j.ChatID,
 			Grounding:    r.Grounding,
 			CtxSize:      r.CtxSize,
-			HardMaxBytes: subagentHardMaxBytes,
+			HardMaxBytes: a.effectiveSubagentHardMax(),
 			UsedBackend:  r.UsedBackend,
 			CostUSD:      subagentCostUSD,
 			FilesChanged: r.FilesChanged,

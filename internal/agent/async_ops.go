@@ -348,6 +348,20 @@ func (a *App) subagentSyncTimeout() time.Duration {
 	return time.Duration(defaultSubagentSyncTimeoutSeconds) * time.Second
 }
 
+// effectiveSubagentHardMax returns the effective hardMax for subagent display.
+// The child's actual hardMax is computed from its own CtxLimit (which may
+// differ from the parent's on the override path), but the child App is not
+// accessible from the parent after dispatchSubagent returns. This uses the
+// parent's activeThresholds as an approximation — correct on the inherit path
+// (the common case), and close enough for TUI display on the override path.
+func (a *App) effectiveSubagentHardMax() int {
+	_, _, hm := a.activeThresholds()
+	if hm > 0 {
+		return hm
+	}
+	return subagentHardMaxBytes
+}
+
 // subagentBatchTimeout returns the batch-level timeout for an async discovery
 // subagent batch. This accounts for multi-wave execution under the global
 // semaphore: with maxPar=2 and 6 jobs, children run in ceil(6/2)=3 waves,
@@ -1084,7 +1098,7 @@ func (a *App) commitAsyncSubagentEffects(op *asyncOp) {
 			ChatID:       s.ChatID,
 			Grounding:    s.Grounding,
 			CtxSize:      s.CtxSize,
-			HardMaxBytes: subagentHardMaxBytes,
+			HardMaxBytes: a.effectiveSubagentHardMax(),
 			UsedBackend:  s.UsedBackend,
 			CostUSD:      sumPricedRows(s.CostRows),
 			FilesChanged: s.FilesChanged,
