@@ -84,6 +84,12 @@ const (
 	// of headroom so the watchdog doesn't kill a legitimately-running child.
 	defaultSubagentTimeoutSeconds = 360
 
+	// defaultSubagentSyncTimeoutSeconds is the fallback sync-path subagent
+	// timeout (edit/tools-tier children). Generous for edit tasks that may
+	// need many iterations. 600s = 10 minutes — enough for a complex edit
+	// with build verification, but finite so a lost child doesn't run forever.
+	defaultSubagentSyncTimeoutSeconds = 600
+
 	// defaultMashuraTimeoutSeconds is the fallback Mashūra async-op timeout
 	// when OracleTimeoutSeconds is 0 (or unset). config.DefaultConfig sets
 	// the same value (300) — they must agree. The watchdog and the worker's
@@ -328,6 +334,18 @@ func (a *App) subagentTimeout() time.Duration {
 		return time.Duration(a.Cfg.SubagentTimeoutSeconds) * time.Second
 	}
 	return time.Duration(defaultSubagentTimeoutSeconds) * time.Second
+}
+
+// subagentSyncTimeout returns the configured sync-path subagent timeout
+// duration. This bounds edit/tools-tier children that previously had no
+// per-child timeout (perChildTimeout=0). 0 (or unset) means use the built-in
+// default (defaultSubagentSyncTimeoutSeconds). The default is also set in
+// config.DefaultConfig so both paths agree.
+func (a *App) subagentSyncTimeout() time.Duration {
+	if a.Cfg.SubagentSyncTimeoutSeconds > 0 {
+		return time.Duration(a.Cfg.SubagentSyncTimeoutSeconds) * time.Second
+	}
+	return time.Duration(defaultSubagentSyncTimeoutSeconds) * time.Second
 }
 
 // subagentBatchTimeout returns the batch-level timeout for an async discovery

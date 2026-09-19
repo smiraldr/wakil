@@ -294,10 +294,12 @@ func (a *App) runParallelSubagentBlock(ctx context.Context, block []proxy.ToolCa
 	// Mixed / non-discovery / refused: synchronous path (child-vs-parent mutation
 	// invariant preserved; no silent async downgrade on refusal — refusal above
 	// returns explicit rejections already).
-	// Sync path: perChildTimeout=0, checkpoint=nil — children are bounded only by
-	// the turn ctx, preserving pre-card-#164 behavior (no 120s cap on edit/tools
-	// children). No checkpointing (no async op to write to).
-	syncResults := a.runPreparedSubagents(ctx, jobs, backend, 0, nil)
+	// Sync path: perChildTimeout from config (subagentSyncTimeout, default
+	// 600s), checkpoint=nil. Previously this was 0 (unbounded) — a lost edit
+	// or tools child ran until the user cancelled. The sync timeout gives
+	// them a generous but finite deadline. No checkpointing (no async op).
+	syncTimeout := a.subagentSyncTimeout()
+	syncResults := a.runPreparedSubagents(ctx, jobs, backend, syncTimeout, nil)
 	return a.finalizeSubagentBlock(jobs, syncResults, out)
 }
 

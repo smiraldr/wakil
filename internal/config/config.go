@@ -245,6 +245,15 @@ type Config struct {
 	// rejected by validation.
 	SubagentTimeoutSeconds int `json:"subagent_timeout_seconds,omitempty"`
 
+	// SubagentSyncTimeoutSeconds bounds how long a synchronous (edit/tools-tier)
+	// subagent may run. Unlike async discovery children (which use
+	// SubagentTimeoutSeconds), sync-path children previously had no per-child
+	// timeout (perChildTimeout=0) — they were bounded only by the turn context.
+	// A lost edit child could run until the user cancelled. This gives them a
+	// generous but finite deadline. 0 = use the built-in default (600s).
+	// Negative is rejected by validation.
+	SubagentSyncTimeoutSeconds int `json:"subagent_sync_timeout_seconds,omitempty"`
+
 	ReadFileSizeLimit   int               `json:"read_file_size_limit,omitempty"`   // max bytes read_file accepts before refusing; default 1048576 (1 MB); 0 = use default
 	MaxFullReadBytes    int               `json:"max_full_read_bytes,omitempty"`    // max bytes read_file_full accepts before refusing; default 262144 (256 KB); 0 = use default
 	MaxBinaryWriteBytes int               `json:"max_binary_write_bytes,omitempty"` // max decoded bytes write_binary_file accepts; default 10485760 (10 MB); 0 = use default
@@ -739,6 +748,7 @@ func DefaultConfig() Config {
 		BackendMaxRetries:      3,
 		MaxParallelSubagents:   2,
 		SubagentTimeoutSeconds: 360, // must match agent.defaultSubagentTimeoutSeconds (raised from 180s: 40 iterations × ~6s + wrap-up + retry margin)
+		SubagentSyncTimeoutSeconds: 600, // generous for edit tasks; bounds edit/tools children that previously had no per-child timeout
 		OracleModel:            "claude-sonnet-4-6",
 		OracleMaxTokens:        4096,
 		OracleAPIKeyEnv:        "ANTHROPIC_API_KEY",
@@ -1401,7 +1411,10 @@ func validateContextLimits(cfg Config) error {
 		return fmt.Errorf("subagent_tool_result_cap must be >= 0 (got %d; 0 = use default)", cfg.SubagentToolResultCap)
 	}
 	if cfg.SubagentTimeoutSeconds < 0 {
-		return fmt.Errorf("subagent_timeout_seconds must be >= 0 (got %d; 0 = use default 180s)", cfg.SubagentTimeoutSeconds)
+		return fmt.Errorf("subagent_timeout_seconds must be >= 0 (got %d; 0 = use default 360s)", cfg.SubagentTimeoutSeconds)
+	}
+	if cfg.SubagentSyncTimeoutSeconds < 0 {
+		return fmt.Errorf("subagent_sync_timeout_seconds must be >= 0 (got %d; 0 = use default 600s)", cfg.SubagentSyncTimeoutSeconds)
 	}
 	return nil
 }
