@@ -711,6 +711,9 @@ type MashuraPanelConfig struct {
 	Mode               string   `json:"mode,omitempty"`                  // "panel" (default) | "fallback" | "fusion"
 	FusionJudge        string   `json:"fusion_judge,omitempty"`          // fusion: judge model; "" = OpenRouter default
 	FusionMaxToolCalls int      `json:"fusion_max_tool_calls,omitempty"` // fusion: 1–16 tool steps; 0 = default (8)
+	ServerTools        []string `json:"server_tools,omitempty"`          // OpenRouter server tool types (e.g. "openrouter:web_search")
+	WebSearchEngine    string   `json:"web_search_engine,omitempty"`     // engine for web_search: auto|native|exa|firecrawl|parallel|perplexity
+	ServerToolMaxCalls int      `json:"server_tool_max_calls,omitempty"` // max server-tool steps per request; 0 = OpenRouter default (30)
 }
 
 // MCPServerConfig declares one MCP server. Transport is "stdio" or "http".
@@ -894,6 +897,75 @@ func LoadConfig(argv []string) (Config, error) {
 				"mashura_fallback_model %q must include a provider prefix "+
 					"(e.g. \"openrouter:anthropic/claude-sonnet-4\" or \"anthropic:claude-sonnet-4-6\")",
 				cfg.MashuraFallbackModel)
+		}
+	}
+
+	// Validate server tool types in named panels. Each must be a known
+	// OpenRouter server tool type. Fusion panels are skipped (server tools
+	// are not wired into the Fusion path — they use FusionMaxToolCalls).
+	validServerTools := map[string]bool{
+		"openrouter:web_search": true,
+		"openrouter:web_fetch":  true,
+		"openrouter:datetime":   true,
+	}
+	validEngines := map[string]bool{
+		"":           true, // default = "auto"
+		"auto":       true,
+		"native":     true,
+		"exa":        true,
+		"firecrawl":  true,
+		"parallel":   true,
+		"perplexity": true,
+	}
+	for pname, p := range cfg.MashuraPanels {
+		// Server tools are not supported in Fusion mode (Fusion has its own
+		// tool-call budget in the plugin block). Reject rather than silently
+		// ignore — the disclosure would otherwise be misleading.
+		if p.Mode == "fusion" && len(p.ServerTools) > 0 {
+			return cfg, fmt.Errorf(
+				"mashura_panels.%s: server_tools are not supported in fusion mode "+
+					"(use fusion_max_tool_calls for the fusion plugin budget)",
+				pname)
+		}
+		for _, st := range p.ServerTools {
+			if !validServerTools[st] {
+				return cfg, fmt.Errorf(
+					"mashura_panels.%s.server_tools: unknown tool type %q "+
+						"(supported: openrouter:web_search, openrouter:web_fetch, openrouter:datetime)",
+					pname, st)
+			}
+		}
+		// Engine without web_search is silently dropped — warn at load time.
+		if p.WebSearchEngine != "" && len(p.ServerTools) > 0 {
+			hasWebSearch := false
+			for _, st := range p.ServerTools {
+				if st == "openrouter:web_search" {
+					hasWebSearch = true
+					break
+				}
+			}
+			if !hasWebSearch {
+				return cfg, fmt.Errorf(
+					"mashura_panels.%s.web_search_engine: set but openrouter:web_search is not in server_tools",
+					pname)
+			}
+			if !validEngines[p.WebSearchEngine] {
+				return cfg, fmt.Errorf(
+					"mashura_panels.%s.web_search_engine: invalid engine %q "+
+						"(supported: auto, native, exa, firecrawl, parallel, perplexity)",
+					pname, p.WebSearchEngine)
+			}
+		}
+		if p.ServerToolMaxCalls < 0 {
+			return cfg, fmt.Errorf(
+				"mashura_panels.%s.server_tool_max_calls: must be >= 0 (0 = default)",
+				pname)
+		}
+		// max_calls without tools is silently dropped — warn at load time.
+		if p.ServerToolMaxCalls > 0 && len(p.ServerTools) == 0 {
+			return cfg, fmt.Errorf(
+				"mashura_panels.%s.server_tool_max_calls: set but server_tools is empty",
+				pname)
 		}
 	}
 

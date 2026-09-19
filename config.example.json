@@ -78,6 +78,8 @@
     }
   },
 
+  "_comment_mashura_server_tools": "OpenRouter server-side tools (per-panel). Enable with server_tools in a named panel, e.g. [\"openrouter:web_search\", \"openrouter:web_fetch\"]. The model decides when to call them; OpenRouter executes server-side. web_search_engine: auto|native|exa|firecrawl|parallel|perplexity. server_tool_max_calls: 0=OpenRouter default (30). Briefing content may be sent to third-party search engines.",
+
   "_comment_lsp": "Language-server-backed code intelligence. Off by default. lsp_servers maps a language to a server; built-in defaults exist for go (gopls), rust (rust-analyzer), python (pyright-langserver), typescript/javascript (typescript-language-server), and c/cpp (clangd). All ship in the default wakil-dev sandbox image.",
 
   "lsp_enabled": false,

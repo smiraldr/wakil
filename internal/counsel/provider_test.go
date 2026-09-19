@@ -395,7 +395,7 @@ func TestRunPanelFusionMode(t *testing.T) {
 // TestPanelDetailFusionMode verifies the gate detail for fusion panels.
 func TestPanelDetailFusionMode(t *testing.T) {
 	models := []string{"~anthropic/claude-opus-latest", "~openai/gpt-latest"}
-	detail := PanelDetail("my-fusion", models, "fusion", "the question", "briefing ctx")
+	detail := PanelDetail("my-fusion", models, "fusion", "the question", "briefing ctx", nil)
 	if !strings.Contains(detail, "fusion") {
 		t.Error("fusion detail should mention fusion mode")
 	}
@@ -411,7 +411,7 @@ func TestPanelDetailFusionMode(t *testing.T) {
 // produces the same format as OracleDetail (backward compat).
 func TestPanelDetailSingleModel(t *testing.T) {
 	oracle := OracleDetail("claude-opus-4-8", "the question", "ctx body")
-	panel := PanelDetail("default", []string{"anthropic:claude-opus-4-8"}, "panel", "the question", "ctx body")
+	panel := PanelDetail("default", []string{"anthropic:claude-opus-4-8"}, "panel", "the question", "ctx body", nil)
 	if oracle != panel {
 		t.Errorf("single-model PanelDetail differs from OracleDetail:\noracle: %q\npanel:  %q", oracle, panel)
 	}
@@ -721,7 +721,7 @@ func TestRunPanelUnknownModeFailsClosed(t *testing.T) {
 // includes the debate metadata and cross-provider sharing disclosure.
 func TestPanelDetailDebateMode(t *testing.T) {
 	models := []string{"anthropic:claude-opus-4-8", "openrouter:google/gemini-2.5-pro"}
-	detail := PanelDetail("review-panel", models, "debate", "the question", "briefing ctx")
+	detail := PanelDetail("review-panel", models, "debate", "the question", "briefing ctx", nil)
 	if !strings.Contains(detail, "debate") {
 		t.Error("debate detail should mention debate mode")
 	}
@@ -799,5 +799,263 @@ func TestRunPanelDebateRound2SurvivesWith2xDeadline(t *testing.T) {
 	}
 	if !strings.Contains(ans, "answer") {
 		t.Errorf("expected round-2 answer, got %q", ans)
+	}
+}
+
+// ── Card #M2: OpenRouter server tools tests ────────────────────────────────
+
+// TestOpenRouterServerToolsInRequest verifies that when ServerTools is set in
+// PanelCallConfig, the request body includes the tools array and max_tool_calls.
+func TestOpenRouterServerToolsInRequest(t *testing.T) {
+	var reqBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"searched answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"server_tool_use":{"web_search_requests":2}}}`))
+	}))
+	defer srv.Close()
+
+	ccfg := PanelCallConfig{
+		MaxTokens:          512,
+		TimeoutSeconds:     5,
+		OpenRouterEndpoint: srv.URL,
+		ServerTools:        []string{"openrouter:web_search", "openrouter:web_fetch"},
+		WebSearchEngine:    "exa",
+		ServerToolMaxCalls: 10,
+	}
+	answer, usage, err := callOpenRouter(context.Background(), "google/gemini-2.5-pro", "key", "q", "ctx", ccfg)
+	if err != nil {
+		t.Fatalf("callOpenRouter: %v", err)
+	}
+	if answer != "searched answer" {
+		t.Errorf("answer = %q, want 'searched answer'", answer)
+	}
+	if usage.WebSearchRequests != 2 {
+		t.Errorf("WebSearchRequests = %d, want 2", usage.WebSearchRequests)
+	}
+
+	// Verify the request body contains tools and max_tool_calls.
+	var req orReq
+	if err := json.Unmarshal(reqBody, &req); err != nil {
+		t.Fatalf("request body not valid JSON: %v\n%s", err, reqBody)
+	}
+	if len(req.Tools) != 2 {
+		t.Fatalf("expected 2 tools, got %d", len(req.Tools))
+	}
+	if req.Tools[0].Type != "openrouter:web_search" {
+		t.Errorf("tools[0].type = %q, want 'openrouter:web_search'", req.Tools[0].Type)
+	}
+	if req.Tools[1].Type != "openrouter:web_fetch" {
+		t.Errorf("tools[1].type = %q, want 'openrouter:web_fetch'", req.Tools[1].Type)
+	}
+	// web_search should have engine parameter.
+	if req.Tools[0].Parameters["engine"] != "exa" {
+		t.Errorf("tools[0].parameters.engine = %v, want 'exa'", req.Tools[0].Parameters["engine"])
+	}
+	// web_fetch should have no parameters.
+	if len(req.Tools[1].Parameters) != 0 {
+		t.Errorf("tools[1].parameters should be empty, got %v", req.Tools[1].Parameters)
+	}
+	if req.MaxToolCalls != 10 {
+		t.Errorf("max_tool_calls = %d, want 10", req.MaxToolCalls)
+	}
+}
+
+// TestOpenRouterNoServerToolsOmitsFields verifies that when ServerTools is empty,
+// the request body does NOT include tools or max_tool_calls fields (omitempty).
+func TestOpenRouterNoServerToolsOmitsFields(t *testing.T) {
+	var reqBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`))
+	}))
+	defer srv.Close()
+
+	ccfg := PanelCallConfig{MaxTokens: 512, TimeoutSeconds: 5, OpenRouterEndpoint: srv.URL}
+	_, _, err := callOpenRouter(context.Background(), "test-model", "key", "q", "ctx", ccfg)
+	if err != nil {
+		t.Fatalf("callOpenRouter: %v", err)
+	}
+
+	// Verify the request body does not contain tools or max_tool_calls.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(reqBody, &raw); err != nil {
+		t.Fatalf("request body not valid JSON: %v", err)
+	}
+	if _, exists := raw["tools"]; exists {
+		t.Error("request body should NOT contain 'tools' field when ServerTools is empty")
+	}
+	if _, exists := raw["max_tool_calls"]; exists {
+		t.Error("request body should NOT contain 'max_tool_calls' field when ServerToolMaxCalls is 0")
+	}
+}
+
+// TestOpenRouterServerToolsArrayContent verifies that when the response message
+// content is an array of content parts (as server tools may return), the text
+// is correctly extracted.
+func TestOpenRouterServerToolsArrayContent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":[{"type":"text","text":"Based on search results: "},{"type":"text","text":"the answer is 42"}]},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`))
+	}))
+	defer srv.Close()
+
+	ccfg := PanelCallConfig{
+		MaxTokens:          512,
+		TimeoutSeconds:     5,
+		OpenRouterEndpoint: srv.URL,
+		ServerTools:        []string{"openrouter:web_search"},
+	}
+	answer, _, err := callOpenRouter(context.Background(), "test-model", "key", "q", "ctx", ccfg)
+	if err != nil {
+		t.Fatalf("callOpenRouter with array content: %v", err)
+	}
+	if answer != "Based on search results: \nthe answer is 42" {
+		t.Errorf("answer = %q, want concatenated text with newline separator", answer)
+	}
+}
+
+// TestOpenRouterServerToolsNullContent verifies that null content (which can
+// occur when server tools are invoked but don't produce text) doesn't crash
+// and returns an error with usage preserved.
+func TestOpenRouterServerToolsNullContent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":null},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":0,"server_tool_use":{"web_search_requests":3}}}`))
+	}))
+	defer srv.Close()
+
+	ccfg := PanelCallConfig{
+		MaxTokens:          512,
+		TimeoutSeconds:     5,
+		OpenRouterEndpoint: srv.URL,
+		ServerTools:        []string{"openrouter:web_search"},
+	}
+	_, usage, err := callOpenRouter(context.Background(), "test-model", "key", "q", "ctx", ccfg)
+	if err == nil {
+		t.Error("expected error for null content")
+	}
+	// Usage should still be preserved (call was billed).
+	if usage.InputTokens != 10 {
+		t.Errorf("usage.InputTokens = %d, want 10", usage.InputTokens)
+	}
+	if usage.WebSearchRequests != 3 {
+		t.Errorf("usage.WebSearchRequests = %d, want 3", usage.WebSearchRequests)
+	}
+}
+
+// TestOpenRouterToolCallsFinishReason verifies that a finish_reason of
+// "tool_calls" (server tools exhausted without final answer) returns an
+// actionable error with usage preserved.
+func TestOpenRouterToolCallsFinishReason(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":""},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"server_tool_use":{"web_search_requests":5}}}`))
+	}))
+	defer srv.Close()
+
+	ccfg := PanelCallConfig{
+		MaxTokens:          512,
+		TimeoutSeconds:     5,
+		OpenRouterEndpoint: srv.URL,
+		ServerTools:        []string{"openrouter:web_search"},
+	}
+	_, usage, err := callOpenRouter(context.Background(), "test-model", "key", "q", "ctx", ccfg)
+	if err == nil {
+		t.Error("expected error for tool_calls finish_reason")
+	}
+	if !strings.Contains(err.Error(), "tool_calls") {
+		t.Errorf("error should mention tool_calls, got: %v", err)
+	}
+	if usage.WebSearchRequests != 5 {
+		t.Errorf("usage.WebSearchRequests = %d, want 5", usage.WebSearchRequests)
+	}
+}
+
+// TestPanelDetailServerToolsDisclosure verifies that PanelDetail includes a
+// tools disclosure when serverTools is non-empty.
+func TestPanelDetailServerToolsDisclosure(t *testing.T) {
+	detail := PanelDetail("research", []string{"openrouter:google/gemini-2.5-pro"}, "panel", "q", "ctx",
+		[]string{"openrouter:web_search", "openrouter:web_fetch"})
+	if !strings.Contains(detail, "web_search") {
+		t.Error("detail should mention web_search")
+	}
+	if !strings.Contains(detail, "web_fetch") {
+		t.Error("detail should mention web_fetch")
+	}
+	if !strings.Contains(detail, "third-party") {
+		t.Error("detail should mention third-party egress risk")
+	}
+}
+
+// TestPanelDetailNoServerTools verifies that PanelDetail with nil serverTools
+// does not include a tools line (backward compat).
+func TestPanelDetailNoServerTools(t *testing.T) {
+	detail := PanelDetail("default", []string{"anthropic:claude-opus-4-8"}, "panel", "q", "ctx", nil)
+	if strings.Contains(detail, "tools:") {
+		t.Error("detail should NOT contain tools line when serverTools is nil")
+	}
+}
+
+// TestOpenRouterServerToolsMixedArray verifies that a content array with
+// mixed valid/invalid parts does not discard the valid text (per-part
+// tolerance). Astra flagged this as the key robustness gap.
+func TestOpenRouterServerToolsMixedArray(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Array with a valid text part, an unknown type, and a malformed part.
+		// The valid text should still be extracted.
+		w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":[{"type":"text","text":"useful answer"},{"type":"other","text":{"value":"metadata"}},{"type":"text","text":"second part"}]},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`))
+	}))
+	defer srv.Close()
+
+	ccfg := PanelCallConfig{
+		MaxTokens:          512,
+		TimeoutSeconds:     5,
+		OpenRouterEndpoint: srv.URL,
+		ServerTools:        []string{"openrouter:web_search"},
+	}
+	answer, _, err := callOpenRouter(context.Background(), "test-model", "key", "q", "ctx", ccfg)
+	if err != nil {
+		t.Fatalf("callOpenRouter with mixed array: %v", err)
+	}
+	// Both text parts should be extracted; the "other" part skipped.
+	if !strings.Contains(answer, "useful answer") {
+		t.Errorf("answer missing 'useful answer': %q", answer)
+	}
+	if !strings.Contains(answer, "second part") {
+		t.Errorf("answer missing 'second part': %q", answer)
+	}
+}
+
+// TestOpenRouter200WithErrorBody verifies that a 200 response with an error
+// object is handled correctly (Fable flagged this — provider failures can
+// return HTTP 200 with an error body).
+func TestOpenRouter200WithErrorBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"error":{"message":"provider overloaded","type":"server_error"},"choices":[]}`))
+	}))
+	defer srv.Close()
+
+	ccfg := PanelCallConfig{MaxTokens: 512, TimeoutSeconds: 5, OpenRouterEndpoint: srv.URL}
+	_, _, err := callOpenRouter(context.Background(), "test-model", "key", "q", "ctx", ccfg)
+	if err == nil {
+		t.Fatal("expected error for 200-with-error-body")
+	}
+	if !strings.Contains(err.Error(), "provider overloaded") {
+		t.Errorf("error should contain provider message, got: %v", err)
+	}
+}
+
+// TestPanelDetailFusionNoToolsDisclosure verifies that PanelDetail does NOT
+// show a tools disclosure for fusion mode even when serverTools is non-empty
+// (the disclosure would be misleading — fusion doesn't use server tools).
+func TestPanelDetailFusionNoToolsDisclosure(t *testing.T) {
+	detail := PanelDetail("fusion-panel", []string{"~anthropic/claude"}, "fusion", "q", "ctx",
+		[]string{"openrouter:web_search"})
+	if strings.Contains(detail, "tools:") {
+		t.Error("fusion PanelDetail should NOT show tools disclosure (server tools not wired for fusion)")
 	}
 }

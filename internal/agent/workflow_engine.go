@@ -208,7 +208,7 @@ func runWFPanel(ctx context.Context, app *App, headline, question, briefing, pan
 	if err != nil {
 		return err.Error(), nil, false
 	}
-	detail := counsel.PanelDetail(panelName, panel.Models, panel.Mode, question, briefing)
+	detail := counsel.PanelDetail(panelName, panel.Models, panel.Mode, question, briefing, panel.ServerTools)
 	if !app.Confirm("mashura__review", headline, detail, false) {
 		return "declined by user", nil, false
 	}
@@ -218,6 +218,9 @@ func runWFPanel(ctx context.Context, app *App, headline, question, briefing, pan
 		AnthropicEndpoint:  app.Cfg.OracleEndpoint,
 		FusionJudge:        panel.FusionJudge,
 		FusionMaxToolCalls: panel.FusionMaxToolCalls,
+		ServerTools:        panel.ServerTools,
+		WebSearchEngine:    panel.WebSearchEngine,
+		ServerToolMaxCalls: panel.ServerToolMaxCalls,
 	}
 	results := counsel.RunPanel(ctx, panel.Models, panel.Mode, question, briefing, ccfg, apiKeys)
 	for _, r := range results {

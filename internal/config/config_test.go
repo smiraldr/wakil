@@ -976,3 +976,150 @@ func TestLoadConfig_MashuraFallbackModelValid(t *testing.T) {
 		t.Errorf("MashuraFallbackModel = %q, want 'openrouter:anthropic/claude-sonnet-4'", cfg.MashuraFallbackModel)
 	}
 }
+
+// TestLoadConfig_ServerToolsOnFusionRejected verifies that setting
+// server_tools on a fusion panel is rejected at load time.
+func TestLoadConfig_ServerToolsOnFusionRejected(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	cfgContent := `{
+		"base_url": "http://proxy:11400",
+		"oracle_enabled": true,
+		"mashura_panels": {
+			"research": {
+				"models": ["~anthropic/claude"],
+				"mode": "fusion",
+				"server_tools": ["openrouter:web_search"]
+			}
+		}
+	}`
+	if err := os.WriteFile(cfgPath, []byte(cfgContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadConfig([]string{"--config", cfgPath, "--exec", "direct"})
+	if err == nil {
+		t.Fatal("expected error for server_tools on fusion panel, got nil")
+	}
+	if !strings.Contains(err.Error(), "fusion") {
+		t.Fatalf("expected fusion error, got: %v", err)
+	}
+}
+
+// TestLoadConfig_UnknownServerToolRejected verifies that an unknown server
+// tool type is rejected at load time.
+func TestLoadConfig_UnknownServerToolRejected(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	cfgContent := `{
+		"base_url": "http://proxy:11400",
+		"oracle_enabled": true,
+		"mashura_panels": {
+			"research": {
+				"models": ["openrouter:anthropic/claude-sonnet-4"],
+				"server_tools": ["openrouter:bogus_tool"]
+			}
+		}
+	}`
+	if err := os.WriteFile(cfgPath, []byte(cfgContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadConfig([]string{"--config", cfgPath, "--exec", "direct"})
+	if err == nil {
+		t.Fatal("expected error for unknown server tool type, got nil")
+	}
+	if !strings.Contains(err.Error(), "bogus_tool") {
+		t.Fatalf("expected error mentioning bogus_tool, got: %v", err)
+	}
+}
+
+// TestLoadConfig_EngineWithoutWebSearchRejected verifies that setting
+// web_search_engine without openrouter:web_search in server_tools is rejected.
+func TestLoadConfig_EngineWithoutWebSearchRejected(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	cfgContent := `{
+		"base_url": "http://proxy:11400",
+		"oracle_enabled": true,
+		"mashura_panels": {
+			"research": {
+				"models": ["openrouter:anthropic/claude-sonnet-4"],
+				"server_tools": ["openrouter:web_fetch"],
+				"web_search_engine": "exa"
+			}
+		}
+	}`
+	if err := os.WriteFile(cfgPath, []byte(cfgContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadConfig([]string{"--config", cfgPath, "--exec", "direct"})
+	if err == nil {
+		t.Fatal("expected error for engine without web_search, got nil")
+	}
+	if !strings.Contains(err.Error(), "web_search_engine") {
+		t.Fatalf("expected web_search_engine error, got: %v", err)
+	}
+}
+
+// TestLoadConfig_MaxCallsWithoutToolsRejected verifies that setting
+// server_tool_max_calls without any server_tools is rejected.
+func TestLoadConfig_MaxCallsWithoutToolsRejected(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	cfgContent := `{
+		"base_url": "http://proxy:11400",
+		"oracle_enabled": true,
+		"mashura_panels": {
+			"research": {
+				"models": ["openrouter:anthropic/claude-sonnet-4"],
+				"server_tool_max_calls": 10
+			}
+		}
+	}`
+	if err := os.WriteFile(cfgPath, []byte(cfgContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadConfig([]string{"--config", cfgPath, "--exec", "direct"})
+	if err == nil {
+		t.Fatal("expected error for max_calls without tools, got nil")
+	}
+	if !strings.Contains(err.Error(), "server_tool_max_calls") {
+		t.Fatalf("expected server_tool_max_calls error, got: %v", err)
+	}
+}
+
+// TestLoadConfig_ValidServerTools verifies that valid server tool configuration
+// passes load-time validation.
+func TestLoadConfig_ValidServerTools(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	cfgContent := `{
+		"base_url": "http://proxy:11400",
+		"oracle_enabled": true,
+		"mashura_panels": {
+			"research": {
+				"models": ["openrouter:anthropic/claude-sonnet-4"],
+				"mode": "panel",
+				"server_tools": ["openrouter:web_search", "openrouter:web_fetch"],
+				"web_search_engine": "exa",
+				"server_tool_max_calls": 15
+			}
+		}
+	}`
+	if err := os.WriteFile(cfgPath, []byte(cfgContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig([]string{"--config", cfgPath, "--exec", "direct"})
+	if err != nil {
+		t.Fatalf("unexpected error for valid server tools config: %v", err)
+	}
+	p := cfg.MashuraPanels["research"]
+	if len(p.ServerTools) != 2 {
+		t.Errorf("ServerTools len = %d, want 2", len(p.ServerTools))
+	}
+	if p.WebSearchEngine != "exa" {
+		t.Errorf("WebSearchEngine = %q, want 'exa'", p.WebSearchEngine)
+	}
+	if p.ServerToolMaxCalls != 15 {
+		t.Errorf("ServerToolMaxCalls = %d, want 15", p.ServerToolMaxCalls)
+	}
+}

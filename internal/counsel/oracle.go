@@ -95,6 +95,10 @@ type oracleResp struct {
 type OracleUsage struct {
 	InputTokens  int64
 	OutputTokens int64
+
+	// WebSearchRequests is the number of OpenRouter server-side web search
+	// requests consumed. 0 when server tools are not used or not reported.
+	WebSearchRequests int64
 }
 
 // CallOracle sends question and (optionally) oracleCtx to the Anthropic Messages
@@ -261,6 +265,15 @@ type PanelCallConfig struct {
 	OpenRouterEndpoint string // "" = "https://openrouter.ai/api/v1/chat/completions"
 	FusionJudge        string // fusion mode: judge model; "" = OpenRouter default
 	FusionMaxToolCalls int    // fusion mode: tool-call steps per model (1–16); 0 = default (8)
+
+	// ServerTools enables OpenRouter server-side tools (web_search, web_fetch,
+	// etc.) for OpenRouter panel members. The model decides when to call them;
+	// OpenRouter executes server-side and returns the final text. No
+	// client-side tool loop is needed. Only applies to the callOpenRouter
+	// path (panel/fallback/debate modes), NOT to fusion.
+	ServerTools        []string
+	WebSearchEngine    string // engine for openrouter:web_search; "" = "auto"
+	ServerToolMaxCalls int    // max server-tool steps per request; 0 = OpenRouter default (30)
 
 	// OnMemberEvent is an optional observer invoked as panel members progress
 	// (start/done/error). It may be called CONCURRENTLY from panel/debate member
@@ -550,6 +563,7 @@ func runDebate(ctx context.Context, models []string, question, briefing string, 
 			totalUsage := r1Results[s.index].Usage
 			totalUsage.InputTokens += usage.InputTokens
 			totalUsage.OutputTokens += usage.OutputTokens
+			totalUsage.WebSearchRequests += usage.WebSearchRequests
 			r2Results[s.index] = PanelMemberResult{
 				PrefixedModel: models[s.index],
 				Model:         model,
@@ -625,10 +639,20 @@ type orFusionPlugin struct {
 
 // orReq is the OpenAI-compatible chat completions request body used by OpenRouter.
 type orReq struct {
-	Model     string           `json:"model"`
-	MaxTokens int              `json:"max_tokens"`
-	Messages  []orMsg          `json:"messages"`
-	Plugins   []orFusionPlugin `json:"plugins,omitempty"`
+	Model        string           `json:"model"`
+	MaxTokens    int              `json:"max_tokens"`
+	Messages     []orMsg          `json:"messages"`
+	Plugins      []orFusionPlugin `json:"plugins,omitempty"`
+	Tools        []orServerTool   `json:"tools,omitempty"`
+	MaxToolCalls int              `json:"max_tool_calls,omitempty"` // server-tool step budget; 0 = omit
+}
+
+// orServerTool is one OpenRouter server-side tool entry. OpenRouter executes
+// these server-side — the model decides when to call them, and the final text
+// is returned in the response.
+type orServerTool struct {
+	Type       string                 `json:"type"`                 // e.g. "openrouter:web_search"
+	Parameters map[string]interface{} `json:"parameters,omitempty"` // engine, max_results, etc.
 }
 
 type orMsg struct {
@@ -639,12 +663,15 @@ type orMsg struct {
 // orResp is the relevant subset of the OpenAI chat completions response.
 type orResp struct {
 	Choices []struct {
-		Message      orMsg  `json:"message"`
-		FinishReason string `json:"finish_reason"`
+		Message      orRespMessage `json:"message"`
+		FinishReason string        `json:"finish_reason"`
 	} `json:"choices"`
 	Usage *struct {
 		PromptTokens     int `json:"prompt_tokens"`
 		CompletionTokens int `json:"completion_tokens"`
+		ServerToolUse    *struct {
+			WebSearchRequests int `json:"web_search_requests"`
+		} `json:"server_tool_use,omitempty"`
 	} `json:"usage"`
 	Error *struct {
 		Message string `json:"message"`
@@ -652,8 +679,66 @@ type orResp struct {
 	} `json:"error"`
 }
 
+// orRespMessage tolerantly decodes the response message — content may be a
+// string, null, or an array of content parts (when server tools are used).
+type orRespMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"-"`
+}
+
+// UnmarshalJSON implements custom unmarshaling for orRespMessage to handle
+// content that may be a string, null, or an array of content parts. Each part
+// is decoded independently — one malformed part does not discard the rest.
+func (m *orRespMessage) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	m.Role = raw.Role
+	// Decode content: string → use directly; null/empty → ""; array → per-part.
+	if len(raw.Content) == 0 || string(raw.Content) == "null" {
+		m.Content = ""
+		return nil
+	}
+	// Try string first.
+	var s string
+	if err := json.Unmarshal(raw.Content, &s); err == nil {
+		m.Content = s
+		return nil
+	}
+	// Try array — decode each part independently so one bad part doesn't
+	// discard the rest. Only "text" parts are extracted; others are skipped.
+	var parts []json.RawMessage
+	if err := json.Unmarshal(raw.Content, &parts); err == nil {
+		var sb strings.Builder
+		for _, part := range parts {
+			var p struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			}
+			if json.Unmarshal(part, &p) == nil && p.Type == "text" {
+				if sb.Len() > 0 {
+					sb.WriteString("\n")
+				}
+				sb.WriteString(p.Text)
+			}
+		}
+		m.Content = sb.String()
+		return nil
+	}
+	// Unknown content shape — leave empty rather than erroring.
+	m.Content = ""
+	return nil
+}
+
 // callOpenRouter sends a consultation to https://openrouter.ai/api/v1 using the
-// OpenAI-compatible chat completions format.
+// OpenAI-compatible chat completions format. When ccfg.ServerTools is non-empty,
+// OpenRouter server-side tools (web_search, web_fetch, etc.) are enabled — the
+// model decides when to call them, OpenRouter executes server-side, and the
+// final text is returned.
 func callOpenRouter(ctx context.Context, model, apiKey, question, briefing string, ccfg PanelCallConfig) (string, OracleUsage, error) {
 	endpoint := openRouterEndpoint
 	if ccfg.OpenRouterEndpoint != "" {
@@ -671,14 +756,34 @@ func callOpenRouter(ctx context.Context, model, apiKey, question, briefing strin
 		userContent += "\n\nContext:\n" + fit.Briefing
 	}
 
-	body, err := json.Marshal(orReq{
+	req := orReq{
 		Model:     model,
 		MaxTokens: fit.MaxTokens,
 		Messages: []orMsg{
 			{Role: "system", Content: oracleSystemPrompt},
 			{Role: "user", Content: userContent},
 		},
-	})
+	}
+
+	// Wire server-side tools when configured. OpenRouter executes these
+	// server-side; the model decides when to call them.
+	if len(ccfg.ServerTools) > 0 {
+		for _, toolType := range ccfg.ServerTools {
+			tool := orServerTool{Type: toolType}
+			// web_search supports an engine parameter.
+			if toolType == "openrouter:web_search" && ccfg.WebSearchEngine != "" {
+				tool.Parameters = map[string]interface{}{
+					"engine": ccfg.WebSearchEngine,
+				}
+			}
+			req.Tools = append(req.Tools, tool)
+		}
+		if ccfg.ServerToolMaxCalls > 0 {
+			req.MaxToolCalls = ccfg.ServerToolMaxCalls
+		}
+	}
+
+	body, err := json.Marshal(req)
 	if err != nil {
 		return "", OracleUsage{}, fmt.Errorf("marshal: %w", err)
 	}
@@ -700,7 +805,7 @@ func callOpenRouter(ctx context.Context, model, apiKey, question, briefing strin
 	if status != http.StatusOK {
 		var apiErr orResp
 		if json.Unmarshal(raw, &apiErr) == nil && apiErr.Error != nil {
-			return "", OracleUsage{}, fmt.Errorf("%d: %s", status, apiErr.Error.Message)
+			return "", OracleUsage{}, fmt.Errorf("openrouter: %d: %s", status, apiErr.Error.Message)
 		}
 		return "", OracleUsage{}, fmt.Errorf("openrouter: HTTP %d", status)
 	}
@@ -709,30 +814,44 @@ func callOpenRouter(ctx context.Context, model, apiKey, question, briefing strin
 	if err := json.Unmarshal(raw, &result); err != nil {
 		return "", OracleUsage{}, fmt.Errorf("parse response: %w", err)
 	}
+
+	// Extract usage immediately after successful decode — preserve it on all
+	// subsequent error paths so billed calls are accounted for.
+	var usage OracleUsage
+	if result.Usage != nil {
+		usage.InputTokens = int64(result.Usage.PromptTokens)
+		usage.OutputTokens = int64(result.Usage.CompletionTokens)
+		if result.Usage.ServerToolUse != nil {
+			usage.WebSearchRequests = int64(result.Usage.ServerToolUse.WebSearchRequests)
+		}
+	}
+
+	// Check for error object in 200 response (provider failures can return
+	// HTTP 200 with an error body).
+	if result.Error != nil {
+		return "", usage, fmt.Errorf("openrouter: %s", result.Error.Message)
+	}
+
 	if len(result.Choices) == 0 {
-		return "", OracleUsage{}, fmt.Errorf("openrouter: no choices in response")
+		return "", usage, fmt.Errorf("openrouter: no choices in response")
 	}
 	// Check truncation before empty-text: a length-truncated response may
 	// have empty content (e.g. budget consumed by reasoning), but the call
 	// was still billed — return usage so cost is recorded.
 	if result.Choices[0].FinishReason == "length" {
-		truncUsage := OracleUsage{}
-		if result.Usage != nil {
-			truncUsage.InputTokens = int64(result.Usage.PromptTokens)
-			truncUsage.OutputTokens = int64(result.Usage.CompletionTokens)
-		}
-		return "", truncUsage, fmt.Errorf("openrouter: response truncated at max_tokens; raise max_tokens to avoid truncation")
+		return "", usage, fmt.Errorf("openrouter: response truncated at max_tokens; raise max_tokens to avoid truncation")
+	}
+	// Handle unfinished tool calls: the model returned tool_calls without a
+	// final text answer. This may indicate the server-tool budget was exhausted
+	// or the model is requesting a client-side tool loop (not supported here).
+	if result.Choices[0].FinishReason == "tool_calls" {
+		return "", usage, fmt.Errorf("openrouter: response ended with tool_calls (no final text answer; consider raising server_tool_max_calls if using server tools)")
 	}
 	text := strings.TrimSpace(result.Choices[0].Message.Content)
 	if text == "" {
-		return "", OracleUsage{}, fmt.Errorf("openrouter: empty response content")
+		return "", usage, fmt.Errorf("openrouter: empty response content")
 	}
 
-	var usage OracleUsage
-	if result.Usage != nil {
-		usage.InputTokens = int64(result.Usage.PromptTokens)
-		usage.OutputTokens = int64(result.Usage.CompletionTokens)
-	}
 	return text, usage, nil
 }
 
@@ -865,8 +984,24 @@ func FormatPanelResult(results []PanelMemberResult) string {
 // PanelDetail builds the confirm-gate detail for a panel call. For a
 // single-model panel it falls back to OracleDetail-style formatting (backward
 // compat). For multi-model panels and fusion it shows the full configuration.
-func PanelDetail(panelName string, models []string, mode, question, oracleCtx string) string {
+// When serverTools is non-empty, a disclosure line is prepended so the user
+// knows the model may search the web / fetch URLs (egress to third-party
+// services). The disclosure is placed BEFORE question/context so the 2,000-byte
+// display cap cannot hide it.
+func PanelDetail(panelName string, models []string, mode, question, oracleCtx string, serverTools []string) string {
 	var sb strings.Builder
+
+	// Server-tool disclosure (before everything else — egress notice).
+	// Suppressed for fusion mode (server tools are not wired into the Fusion
+	// path — they use FusionMaxToolCalls in the plugin block).
+	if len(serverTools) > 0 && mode != "fusion" {
+		labels := make([]string, len(serverTools))
+		for i, t := range serverTools {
+			labels[i] = strings.TrimPrefix(t, "openrouter:")
+		}
+		fmt.Fprintf(&sb, "tools:    %s enabled (model may search web/fetch URLs — briefing content may be sent to third-party services)\n", strings.Join(labels, ", "))
+	}
+
 	switch {
 	case mode == "fusion":
 		fmt.Fprintf(&sb, "panel:    %s (fusion, %d analysis models)\n", panelName, len(models))

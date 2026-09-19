@@ -209,7 +209,7 @@ func (a *App) runMashuraCore(ctx context.Context, name string, tc proxy.ToolCall
 	}
 
 	maxTokens := a.mashuraMaxTokensFor(name)
-	detail := counsel.PanelDetail(panelName, panel.Models, panel.Mode, question, briefing)
+	detail := counsel.PanelDetail(panelName, panel.Models, panel.Mode, question, briefing, panel.ServerTools)
 	if !skipGate && !a.Confirm(name, "Send to external AI?", detail, false) {
 		return "[declined by user]"
 	}
@@ -227,6 +227,9 @@ func (a *App) runMashuraCore(ctx context.Context, name string, tc proxy.ToolCall
 		AnthropicEndpoint:  a.Cfg.OracleEndpoint,
 		FusionJudge:        panel.FusionJudge,
 		FusionMaxToolCalls: panel.FusionMaxToolCalls,
+		ServerTools:        panel.ServerTools,
+		WebSearchEngine:    panel.WebSearchEngine,
+		ServerToolMaxCalls: panel.ServerToolMaxCalls,
 	}
 	models, mode := panel.Models, panel.Mode
 
