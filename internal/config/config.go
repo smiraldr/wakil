@@ -254,6 +254,17 @@ type Config struct {
 	// Negative is rejected by validation.
 	SubagentSyncTimeoutSeconds int `json:"subagent_sync_timeout_seconds,omitempty"`
 
+	// SubagentEditVerifyCommand overrides the post-edit verification command
+	// run inside the worktree after an edit-tier subagent finishes. When empty
+	// (the default), auto-detection is used: if a go.mod file exists at the
+	// workspace root, `go build ./...` runs. Set to a custom command to override
+	// (e.g. "make test" or "cargo check"). Set to "-" to disable verification
+	// entirely. The command runs with the worktree as cwd, through the
+	// executor, with a 120s timeout. Verification is advisory (non-blocking):
+	// failures are reported as a high-weight finding + uncertainty but do not
+	// prevent the patch from being applied.
+	SubagentEditVerifyCommand string `json:"subagent_edit_verify_command,omitempty"`
+
 	ReadFileSizeLimit   int               `json:"read_file_size_limit,omitempty"`   // max bytes read_file accepts before refusing; default 1048576 (1 MB); 0 = use default
 	MaxFullReadBytes    int               `json:"max_full_read_bytes,omitempty"`    // max bytes read_file_full accepts before refusing; default 262144 (256 KB); 0 = use default
 	MaxBinaryWriteBytes int               `json:"max_binary_write_bytes,omitempty"` // max decoded bytes write_binary_file accepts; default 10485760 (10 MB); 0 = use default

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	wakilexec "github.com/treeol/wakil/internal/exec"
 )
@@ -922,7 +923,256 @@ func TestPruneStaleDockerWorktreeMetadata_StaleEntryRemoved(t *testing.T) {
 	os.RemoveAll(liveWtDir)
 }
 
-// ---- Dirty-parent baseline tests (Card #5) ----
+// ---- Post-edit verification tests (Card #7) ----
+
+// TestVerifyWorktree_GoBuildPasses verifies that verifyWorktreeEdits detects a
+// Go project (go.mod present) and runs `go build ./...` which passes on a
+// clean worktree.
+func TestVerifyWorktree_GoBuildPasses(t *testing.T) {
+	dir := setupGitRepo(t)
+	// Add a go.mod so auto-detection triggers.
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module test\n\ngo 1.21\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Add a minimal Go file that compiles.
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Commit the Go files so they're in HEAD (needed for worktree checkout).
+	cmd := osexec.Command("git", "-C", dir, "add", "go.mod", "main.go")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v\n%s", err, out)
+	}
+	cmd = osexec.Command("git", "-C", dir, "commit", "-m", "add go files")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v\n%s", err, out)
+	}
+
+	app := newWorktreeTestApp(t, dir)
+	wtDir, err := createWorktree(context.Background(), app)
+	if err != nil {
+		t.Fatalf("createWorktree: %v", err)
+	}
+	defer removeWorktree(context.Background(), app, wtDir)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	vr := verifyWorktreeEdits(ctx, app, wtDir)
+	if vr.status != "passed" {
+		t.Errorf("verification should pass on clean Go worktree: status=%s output=%s", vr.status, vr.output)
+	}
+	if vr.command != "go build ./..." {
+		t.Errorf("expected go build command, got %q", vr.command)
+	}
+}
+
+// TestVerifyWorktree_GoBuildFails verifies that a broken build is detected
+// and reported as "failed" (non-blocking — the patch still applies).
+func TestVerifyWorktree_GoBuildFails(t *testing.T) {
+	dir := setupGitRepo(t)
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module test\n\ngo 1.21\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// A Go file with a syntax error.
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n\nfunc main( {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := osexec.Command("git", "-C", dir, "add", "go.mod", "main.go")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v\n%s", err, out)
+	}
+	cmd = osexec.Command("git", "-C", dir, "commit", "-m", "add go files")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v\n%s", err, out)
+	}
+
+	app := newWorktreeTestApp(t, dir)
+	wtDir, err := createWorktree(context.Background(), app)
+	if err != nil {
+		t.Fatalf("createWorktree: %v", err)
+	}
+	defer removeWorktree(context.Background(), app, wtDir)
+
+	// Break the build in the worktree (simulates child's broken edit).
+	if err := os.WriteFile(filepath.Join(wtDir, "main.go"), []byte("package main\n\nfunc main( {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	vr := verifyWorktreeEdits(ctx, app, wtDir)
+	if vr.status != "failed" {
+		t.Errorf("verification should fail on broken build: status=%s output=%s", vr.status, vr.output)
+	}
+	// Output should contain the build error.
+	if vr.output == "" {
+		t.Error("failed verification should have non-empty output")
+	}
+}
+
+// TestVerifyWorktree_NoGoMod_Skipped verifies that verification is skipped
+// when no go.mod is present and no override is configured.
+func TestVerifyWorktree_NoGoMod_Skipped(t *testing.T) {
+	dir := setupGitRepo(t)
+	app := newWorktreeTestApp(t, dir)
+	wtDir, err := createWorktree(context.Background(), app)
+	if err != nil {
+		t.Fatalf("createWorktree: %v", err)
+	}
+	defer removeWorktree(context.Background(), app, wtDir)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	vr := verifyWorktreeEdits(ctx, app, wtDir)
+	if vr.status != "skipped" {
+		t.Errorf("verification should be skipped without go.mod: status=%s", vr.status)
+	}
+	if vr.command != "none" {
+		t.Errorf("expected command 'none', got %q", vr.command)
+	}
+}
+
+// TestVerifyWorktree_CustomCommand verifies that a configured override
+// command runs instead of auto-detection.
+func TestVerifyWorktree_CustomCommand(t *testing.T) {
+	dir := setupGitRepo(t)
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module test\n\ngo 1.21\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := osexec.Command("git", "-C", dir, "add", "go.mod")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v\n%s", err, out)
+	}
+	cmd = osexec.Command("git", "-C", dir, "commit", "-m", "add go.mod")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v\n%s", err, out)
+	}
+
+	app := newWorktreeTestApp(t, dir)
+	app.Cfg.SubagentEditVerifyCommand = "echo custom-verify-ok"
+	wtDir, err := createWorktree(context.Background(), app)
+	if err != nil {
+		t.Fatalf("createWorktree: %v", err)
+	}
+	defer removeWorktree(context.Background(), app, wtDir)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	vr := verifyWorktreeEdits(ctx, app, wtDir)
+	if vr.status != "passed" {
+		t.Errorf("custom command should pass: status=%s output=%s", vr.status, vr.output)
+	}
+	if vr.command != "echo custom-verify-ok" {
+		t.Errorf("expected custom command, got %q", vr.command)
+	}
+}
+
+// TestVerifyWorktree_DisabledByConfig verifies that setting the config to "-"
+// skips verification entirely.
+func TestVerifyWorktree_DisabledByConfig(t *testing.T) {
+	dir := setupGitRepo(t)
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module test\n\ngo 1.21\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := osexec.Command("git", "-C", dir, "add", "go.mod")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v\n%s", err, out)
+	}
+	cmd = osexec.Command("git", "-C", dir, "commit", "-m", "add go.mod")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v\n%s", err, out)
+	}
+
+	app := newWorktreeTestApp(t, dir)
+	app.Cfg.SubagentEditVerifyCommand = "-"
+	wtDir, err := createWorktree(context.Background(), app)
+	if err != nil {
+		t.Fatalf("createWorktree: %v", err)
+	}
+	defer removeWorktree(context.Background(), app, wtDir)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	vr := verifyWorktreeEdits(ctx, app, wtDir)
+	if vr.status != "skipped" {
+		t.Errorf("verification should be skipped when disabled: status=%s", vr.status)
+	}
+	if vr.command != "disabled" {
+		t.Errorf("expected command 'disabled', got %q", vr.command)
+	}
+}
+
+// TestVerifyWorktree_Timeout verifies that a command exceeding the timeout is
+// reported as "timed_out", not "failed".
+func TestVerifyWorktree_Timeout(t *testing.T) {
+	dir := setupGitRepo(t)
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module test\n\ngo 1.21\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := osexec.Command("git", "-C", dir, "add", "go.mod")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v\n%s", err, out)
+	}
+	cmd = osexec.Command("git", "-C", dir, "commit", "-m", "add go.mod")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v\n%s", err, out)
+	}
+
+	app := newWorktreeTestApp(t, dir)
+	app.Cfg.SubagentEditVerifyCommand = "sleep 30"
+	wtDir, err := createWorktree(context.Background(), app)
+	if err != nil {
+		t.Fatalf("createWorktree: %v", err)
+	}
+	defer removeWorktree(context.Background(), app, wtDir)
+
+	// Use a very short timeout so the sleep exceeds it.
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	vr := verifyWorktreeEdits(ctx, app, wtDir)
+	if vr.status != "timed_out" {
+		t.Errorf("sleep should time out: status=%s output=%s", vr.status, vr.output)
+	}
+}
+
+// TestVerifyWorktree_OutputBounded verifies that verification output is
+// truncated to a reasonable size for the summary.
+func TestVerifyWorktree_OutputBounded(t *testing.T) {
+	dir := setupGitRepo(t)
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module test\n\ngo 1.21\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := osexec.Command("git", "-C", dir, "add", "go.mod")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v\n%s", err, out)
+	}
+	cmd = osexec.Command("git", "-C", dir, "commit", "-m", "add go.mod")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v\n%s", err, out)
+	}
+
+	app := newWorktreeTestApp(t, dir)
+	// Generate a lot of output.
+	app.Cfg.SubagentEditVerifyCommand = "seq 1 10000"
+	wtDir, err := createWorktree(context.Background(), app)
+	if err != nil {
+		t.Fatalf("createWorktree: %v", err)
+	}
+	defer removeWorktree(context.Background(), app, wtDir)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	vr := verifyWorktreeEdits(ctx, app, wtDir)
+	if vr.status != "passed" {
+		t.Errorf("seq should pass: status=%s", vr.status)
+	}
+	if len(vr.output) > 3000 {
+		t.Errorf("output should be bounded to ~2 KB, got %d bytes", len(vr.output))
+	}
+	if !strings.Contains(vr.output, "truncated") {
+		t.Error("truncated output should contain truncation marker")
+	}
+}
 
 // TestDirtyParent_WorktreeSeesUncommittedChanges verifies that the worktree
 // baseline includes the parent's uncommitted tracked changes — the core fix.

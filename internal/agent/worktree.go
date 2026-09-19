@@ -95,6 +95,12 @@ const worktreeOwnerFile = ".wakil-owner-pid"
 // cancelled) request context.
 const worktreeOpTimeout = 30 * time.Second
 
+// worktreeVerifyTimeout is the timeout for post-edit verification commands
+// (e.g. go build). Separate from worktreeOpTimeout so a slow build doesn't
+// consume the patch-application deadline. Verification is advisory — a timeout
+// is reported as "verification timed out," not "build failed."
+const worktreeVerifyTimeout = 120 * time.Second
+
 // worktreeCleanupTimeout is the maximum time allowed for worktree cleanup
 // after a child finishes. Short enough that it doesn't block the parent, long
 // enough for git to remove the worktree directory.
@@ -1055,4 +1061,98 @@ func pruneStaleDockerWorktreeMetadata(ctx context.Context, a *App) {
 		// gitdir target is gone — stale metadata. Remove the .git/worktrees/<name> entry.
 		_, _ = a.Exec.RunShell(ctx, "rm -rf "+shellQuote(wtMetaDir))
 	}
+}
+
+// verifyWorktreeResult holds the outcome of a post-edit verification run.
+type verifyWorktreeResult struct {
+	status  string // "passed", "failed", "timed_out", "unavailable", "skipped"
+	command string // the command that was run (or "none" if skipped)
+	output  string // bounded output (first ~2 KB of stdout+stderr)
+}
+
+// verifyWorktreeEdits runs a verification command inside the worktree after
+// the child finishes editing but before the patch is applied to the parent.
+// The verification is advisory (non-blocking): failures are reported to the
+// parent model via a high-weight finding + uncertainty, but the patch is still
+// applied (the parent model can decide whether to keep or revert).
+//
+// Command selection (first match wins):
+//  1. Cfg.SubagentEditVerifyCommand (if set to "-", verification is disabled).
+//  2. Auto-detection: if go.mod exists at the workspace root → "go build ./...".
+//  3. No detection → skipped (reported as a short uncertainty).
+//
+// The command runs through the executor with cwd = worktree dir, using a
+// dedicated bounded context (worktreeVerifyTimeout). In docker mode, the
+// worktree dir is a container path and the executor handles it correctly.
+//
+// The worktree HEAD is the snapshot commit (parent's working tree at dispatch
+// time), so a build failure may reflect pre-existing parent issues, not the
+// child's edits. The result is labeled "worktree verification" to make this
+// scope explicit.
+func verifyWorktreeEdits(ctx context.Context, a *App, wtDir string) verifyWorktreeResult {
+	cmd := a.resolveVerifyCommand()
+	if cmd == "-" {
+		return verifyWorktreeResult{status: "skipped", command: "disabled"}
+	}
+	if cmd == "" {
+		return verifyWorktreeResult{status: "skipped", command: "none"}
+	}
+
+	// Run the command with cwd = worktree dir. The executor's RunShell runs
+	// from WorkspaceRoot by default; we prefix with `cd <wtDir> &&` to change
+	// into the worktree. shellQuote prevents path injection.
+	fullCmd := fmt.Sprintf("cd %s && %s 2>&1", shellQuote(wtDir), cmd)
+	out, err := a.Exec.RunShell(ctx, fullCmd)
+
+	// Bound the output to ~2 KB for the summary.
+	if len(out) > 2048 {
+		out = out[:2048] + "\n… [output truncated]"
+	}
+
+	if err == nil {
+		return verifyWorktreeResult{status: "passed", command: cmd, output: strings.TrimSpace(out)}
+	}
+
+	// Distinguish timeout from other failures. The executor returns a generic
+	// error on non-zero exit; a timeout is indicated by ctx.Err() != nil.
+	if ctx.Err() != nil {
+		return verifyWorktreeResult{status: "timed_out", command: cmd, output: strings.TrimSpace(out)}
+	}
+
+	// Check for "command not found" — toolchain absent in the environment.
+	lower := strings.ToLower(strings.TrimSpace(out))
+	if strings.Contains(lower, "command not found") || strings.Contains(lower, "no such file or directory") {
+		return verifyWorktreeResult{status: "unavailable", command: cmd, output: strings.TrimSpace(out)}
+	}
+
+	return verifyWorktreeResult{status: "failed", command: cmd, output: strings.TrimSpace(out)}
+}
+
+// resolveVerifyCommand determines which verification command to run, based on
+// config override and auto-detection. Returns:
+//   - "-" if verification is explicitly disabled.
+//   - A non-empty command string if configured or auto-detected.
+//   - "" if no command is available (verification is skipped).
+func (a *App) resolveVerifyCommand() string {
+	// Explicit override.
+	if v := strings.TrimSpace(a.Cfg.SubagentEditVerifyCommand); v != "" {
+		return v
+	}
+
+	// Auto-detection: Go projects (go.mod at workspace root).
+	repoRoot := a.Exec.WorkspaceRoot()
+	if _, err := os.Stat(filepath.Join(repoRoot, "go.mod")); err == nil {
+		return "go build ./..."
+	}
+
+	// Docker mode: go.mod check needs to go through the executor.
+	if isDockerExecutor(a.Exec) {
+		ctx := context.Background()
+		out, err := a.Exec.RunShell(ctx, "test -f "+shellQuote(filepath.Join(repoRoot, "go.mod"))+" 2>/dev/null && echo yes || echo no")
+		if err == nil && strings.TrimSpace(out) == "yes" {
+			return "go build ./..."
+		}
+	}
+
+	return ""
 }
