@@ -15,20 +15,25 @@ package agent
 // conflict is reported — never silently dropped.
 //
 // Lifecycle:
-//   1. createWorktree: `git worktree add --detach <dir> HEAD` — detached HEAD
-//      so the worktree isn't tied to a branch (no branch to clean up).
-//   2. Child runs with an executor rooted at the worktree dir:
+//   1. captureWorktreeSnapshot: stage the parent's working tree (tracked +
+//      non-ignored untracked files) in a temp index, write a tree, create a
+//      dangling commit. The parent's index/HEAD are untouched.
+//   2. createWorktree: `git worktree add --detach <dir> <snapshot-commit>` —
+//      the worktree starts from the snapshot, NOT HEAD. The child sees the
+//      same code the parent sees (including uncommitted changes).
+//   3. Child runs with an executor rooted at the worktree dir:
 //      - DirectExecutor in direct mode (host filesystem).
 //      - DockerWorktreeExecutor in docker mode (shares the parent's container,
 //        re-rooted at the worktree dir inside container /tmp).
-//   3. diffWorktree: `git diff --cached --binary HEAD` in the worktree —
-//      captures all changes including binary files and new files (staged
-//      first with `git add -A`).
-//   4. applyPatch: `git apply --check` then `git apply` in the parent
+//   4. diffWorktree: `git diff --cached --binary HEAD` in the worktree —
+//      since HEAD is the snapshot, this produces ONLY the child's delta
+//      (parent dirty changes are in the baseline, not in the patch). Includes
+//      binary files and new files (staged first with `git add -A`).
+//   5. applyPatch: `git apply --check` then `git apply` in the parent
 //      workspace — serialized by patchApplyMu. We use `--check` first to
 //      atomically test whether the patch applies cleanly; if it does, we
 //      apply it. If `--check` fails, the parent workspace is untouched.
-//   5. removeWorktree: `git worktree remove --force <dir>` — cleans up.
+//   6. removeWorktree: `git worktree remove --force <dir>` — cleans up.
 //
 // Crash safety: stale worktrees (from a crashed session) are pruned on
 // startup. In direct mode, worktree dirs are under the system temp dir,
@@ -43,18 +48,9 @@ package agent
 // back to the existing serialized behavior (subagentWriterMu) with a one-line
 // warning printed to the parent's output.
 //
-// Dirty-parent limitation: the worktree is created from HEAD, not the parent's
-// working tree. Uncommitted changes (including patches from sibling children)
-// are NOT visible to the child. This means:
-//   - If the parent has uncommitted changes to file A, and the child also
-//     modifies A, the patch will conflict (the child's baseline differs from
-//     the parent's current state). This is the correct behavior — the conflict
-//     is detected and reported.
-//   - If the parent has uncommitted changes to file B, and the child modifies
-//     file A (disjoint), the patch applies cleanly. Also correct.
-//   - .gitignore'd files (deps, build outputs, .env) are not present in the
-//     worktree. The child cannot read or modify them. This is a security
-//     improvement, not a limitation.
+// .gitignore'd files (deps, build outputs, .env) are not present in the
+// worktree. The child cannot read or modify them. This is a security
+// improvement, not a limitation.
 
 import (
 	"context"
@@ -138,50 +134,74 @@ func isGitRepo(ctx context.Context, a *App) bool {
 	return strings.TrimSpace(out) == "true"
 }
 
-// createWorktree creates a new git worktree at a temp dir, detached at HEAD.
-// Returns the worktree directory path (executor-visible path). The caller must
-// call removeWorktree when done (typically via defer).
+// createWorktree creates a new git worktree at a temp dir, detached at a
+// snapshot of the parent's current working tree (tracked + non-ignored
+// untracked files). Returns the worktree directory path (executor-visible
+// path). The caller must call removeWorktree when done (typically via defer).
 //
-// The worktree is created from the parent workspace's current HEAD, so the
-// child sees the committed state the parent sees at dispatch time. The
-// --detach flag means the worktree is not on any branch — no branch to clean
-// up later. Uncommitted changes in the parent are NOT copied (see the dirty-
-// parent limitation in the file header).
+// The worktree baseline is NOT HEAD — it is a synthetic commit capturing the
+// parent's working-tree content at dispatch time. This means:
+//   - The child sees uncommitted parent changes (the most common case in an
+//     interactive coding session).
+//   - The child sees non-ignored untracked files (deps, build outputs that
+//     aren't .gitignore'd).
+//   - diffWorktree's `git diff --cached --binary HEAD` produces ONLY the
+//     child's delta — parent dirty changes are in the baseline, not in the
+//     patch. A no-op child produces an empty patch even when the parent is
+//     dirty.
+//
+// The snapshot is created by staging the parent's working tree (`git add -A`)
+// in a temporary index, writing a tree object (`git write-tree`), and creating
+// a dangling commit (`git commit-tree`). This avoids touching the parent's
+// index, working tree, or HEAD. The dangling objects are cleaned up by git gc
+// later.
+//
+// Snapshot capture holds patchApplyMu to prevent a sibling's patch from
+// changing the parent workspace mid-snapshot (torn baseline). This serializes
+// worktree creation, which is cheap relative to the child run.
+//
+// On any failure (snapshot, worktree add, etc.), the worktree is cleaned up
+// and the error is returned so the caller falls back to serialized mode.
 //
 // In direct mode, the temp dir is on the host filesystem (via os.MkdirTemp).
 // In docker mode, the temp dir is inside the container's /tmp (via mktemp -d
 // through the executor) so it's visible to in-container git.
 func createWorktree(ctx context.Context, a *App) (string, error) {
+	// Capture a coherent snapshot of the parent's working tree under
+	// patchApplyMu so a sibling can't apply a patch mid-snapshot.
+	patchApplyMu.Lock()
+	snapshotOID, snapErr := captureWorktreeSnapshot(ctx, a)
+	patchApplyMu.Unlock()
+	if snapErr != nil {
+		return "", fmt.Errorf("worktree snapshot: %w", snapErr)
+	}
+
 	var dir string
 	if isDockerExecutor(a.Exec) {
-		// Docker mode: create temp dir inside the container via the executor.
-		// mktemp -d creates a directory in TMPDIR (defaults to /tmp).
 		out, err := a.Exec.RunShell(ctx, "mktemp -d -p /tmp "+worktreePrefix+"XXXXXX 2>&1")
 		if err != nil {
 			return "", fmt.Errorf("worktree: could not create temp dir: %s", strings.TrimSpace(out))
 		}
 		dir = strings.TrimSpace(out)
-		// Remove the empty dir so git worktree add can create it fresh.
 		_, _ = a.Exec.RunShell(ctx, "rm -rf "+shellQuote(dir))
 	} else {
-		// Direct mode: create temp dir on the host.
 		tmp, err := os.MkdirTemp("", worktreePrefix)
 		if err != nil {
 			return "", fmt.Errorf("worktree: could not create temp dir: %w", err)
 		}
 		dir = tmp
-		// Remove the empty dir so git worktree add can create it fresh.
 		_ = os.RemoveAll(dir)
 	}
 
 	repoRoot := a.Exec.WorkspaceRoot()
-	cmd := fmt.Sprintf("%sgit -C %s worktree add --detach %s HEAD 2>&1",
+	cmd := fmt.Sprintf("%sgit -C %s %s worktree add --detach %s %s 2>&1",
 		gitBaseEnv(),
 		shellQuote(repoRoot),
-		shellQuote(dir))
+		gitBaseArgs(),
+		shellQuote(dir),
+		shellQuote(snapshotOID))
 	out, err := a.Exec.RunShell(ctx, cmd)
 	if err != nil {
-		// Cleanup the temp dir on failure.
 		if isDockerExecutor(a.Exec) {
 			_, _ = a.Exec.RunShell(ctx, "rm -rf "+shellQuote(dir))
 		} else {
@@ -190,15 +210,121 @@ func createWorktree(ctx context.Context, a *App) (string, error) {
 		return "", fmt.Errorf("git worktree add: %s", strings.TrimSpace(out))
 	}
 
-	// Write a session-ownership marker so pruneStaleWorktrees can detect
-	// worktrees left behind by crashed sessions. The marker contains the
-	// current process's PID — pruning checks if this PID is still alive.
-	// The marker is stored in the worktree's gitdir (under the main repo's
-	// .git/worktrees/<name>/), NOT in the worktree directory itself — this
-	// avoids it appearing in git add -A / diffs.
 	writeWorktreeOwnerMarker(a, dir)
-
 	return dir, nil
+}
+
+// captureWorktreeSnapshot creates a dangling commit from the parent's current
+// working-tree content (tracked + non-ignored untracked files) and returns its
+// OID. The parent's index, working tree, and HEAD are not modified.
+//
+// Steps:
+//  1. Copy the parent's index to a temp file (so we can stage without touching
+//     the parent's real index).
+//  2. In the temp index: `git add -A` (stages all working-tree content
+//     including untracked non-ignored files).
+//  3. `git write-tree` → tree OID.
+//  4. `git commit-tree <tree> -p HEAD` → dangling commit OID. Uses
+//     GIT_AUTHOR_IDENTITY env vars to avoid depending on user config.
+//  5. Clean up the temp index.
+//
+// The caller must hold patchApplyMu to ensure the parent's working tree is
+// stable during the snapshot.
+func captureWorktreeSnapshot(ctx context.Context, a *App) (string, error) {
+	repoRoot := a.Exec.WorkspaceRoot()
+
+	// Create a temp index file by copying the parent's current index.
+	// In direct mode, use host temp files. In docker mode, use container /tmp.
+	var tempIndexPath string
+	if isDockerExecutor(a.Exec) {
+		out, err := a.Exec.RunShell(ctx, "mktemp -p /tmp wakil-snap-idx-XXXXXX 2>&1")
+		if err != nil {
+			return "", fmt.Errorf("create temp index: %s", strings.TrimSpace(out))
+		}
+		tempIndexPath = strings.TrimSpace(out)
+	} else {
+		f, err := os.CreateTemp("", "wakil-snap-idx-*")
+		if err != nil {
+			return "", fmt.Errorf("create temp index: %w", err)
+		}
+		tempIndexPath = f.Name()
+		f.Close()
+	}
+	// Clean up the temp index on all exit paths.
+	cleanupTempIndex := func() {
+		if isDockerExecutor(a.Exec) {
+			_, _ = a.Exec.RunShell(ctx, "rm -f "+shellQuote(tempIndexPath))
+		} else {
+			_ = os.Remove(tempIndexPath)
+		}
+	}
+
+	// Copy the parent's index to the temp index. Using the parent's index as
+	// a starting point (instead of an empty index) keeps `git add -A`
+	// incremental and avoids recording sparse-checkout paths as deletions.
+	gitDir := filepath.Join(repoRoot, ".git")
+	srcIndex := filepath.Join(gitDir, "index")
+	var copyCmd string
+	if isDockerExecutor(a.Exec) {
+		copyCmd = fmt.Sprintf("cp %s %s 2>&1", shellQuote(srcIndex), shellQuote(tempIndexPath))
+	} else {
+		copyCmd = fmt.Sprintf("cp %s %s 2>&1", shellQuote(srcIndex), shellQuote(tempIndexPath))
+	}
+	if out, err := a.Exec.RunShell(ctx, copyCmd); err != nil {
+		cleanupTempIndex()
+		return "", fmt.Errorf("copy parent index: %s", strings.TrimSpace(out))
+	}
+
+	// Stage all working-tree content using the temp index.
+	addCmd := fmt.Sprintf("%sGIT_INDEX_FILE=%s git -C %s %s add -A 2>&1",
+		gitBaseEnv(),
+		shellQuote(tempIndexPath),
+		shellQuote(repoRoot),
+		gitBaseArgs())
+	if out, err := a.Exec.RunShell(ctx, addCmd); err != nil {
+		cleanupTempIndex()
+		return "", fmt.Errorf("git add -A (snapshot): %s", strings.TrimSpace(out))
+	}
+
+	// Write the tree object from the temp index.
+	writeTreeCmd := fmt.Sprintf("%sGIT_INDEX_FILE=%s git -C %s %s write-tree 2>&1",
+		gitBaseEnv(),
+		shellQuote(tempIndexPath),
+		shellQuote(repoRoot),
+		gitBaseArgs())
+	treeOut, err := a.Exec.RunShell(ctx, writeTreeCmd)
+	if err != nil {
+		cleanupTempIndex()
+		return "", fmt.Errorf("git write-tree: %s", strings.TrimSpace(treeOut))
+	}
+	treeOID := strings.TrimSpace(treeOut)
+	if treeOID == "" {
+		cleanupTempIndex()
+		return "", fmt.Errorf("git write-tree returned empty OID")
+	}
+
+	// Create a dangling commit from the tree, with HEAD as parent.
+	// Use explicit author/committer identity to avoid depending on user config.
+	commitTreeCmd := fmt.Sprintf(
+		"%sGIT_AUTHOR_NAME=wakil GIT_AUTHOR_EMAIL=wakil@local GIT_COMMITTER_NAME=wakil GIT_COMMITTER_EMAIL=wakil@local "+
+			"git -C %s %s commit-tree %s -p HEAD -m wakil-snapshot 2>&1",
+		gitBaseEnv(),
+		shellQuote(repoRoot),
+		gitBaseArgs(),
+		shellQuote(treeOID))
+	commitOut, err := a.Exec.RunShell(ctx, commitTreeCmd)
+	if err != nil {
+		cleanupTempIndex()
+		return "", fmt.Errorf("git commit-tree: %s", strings.TrimSpace(commitOut))
+	}
+	commitOID := strings.TrimSpace(commitOut)
+	if commitOID == "" {
+		cleanupTempIndex()
+		return "", fmt.Errorf("git commit-tree returned empty OID")
+	}
+
+	cleanupTempIndex()
+	return commitOID, nil
 }
 
 // writeWorktreeOwnerMarker writes a file in the worktree's gitdir (not the

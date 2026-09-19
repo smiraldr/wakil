@@ -921,3 +921,252 @@ func TestPruneStaleDockerWorktreeMetadata_StaleEntryRemoved(t *testing.T) {
 	// Clean up the live worktree dir.
 	os.RemoveAll(liveWtDir)
 }
+
+// ---- Dirty-parent baseline tests (Card #5) ----
+
+// TestDirtyParent_WorktreeSeesUncommittedChanges verifies that the worktree
+// baseline includes the parent's uncommitted tracked changes — the core fix.
+func TestDirtyParent_WorktreeSeesUncommittedChanges(t *testing.T) {
+	dir := setupGitRepo(t)
+	app := newWorktreeTestApp(t, dir)
+
+	// Make an uncommitted change in the parent.
+	if err := os.WriteFile(filepath.Join(dir, "hello.txt"), []byte("dirty parent\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	wtDir, err := createWorktree(context.Background(), app)
+	if err != nil {
+		t.Fatalf("createWorktree: %v", err)
+	}
+	defer removeWorktree(context.Background(), app, wtDir)
+
+	// The worktree should see the parent's dirty content, not HEAD's.
+	content, err := os.ReadFile(filepath.Join(wtDir, "hello.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "dirty parent\n" {
+		t.Errorf("worktree should see parent's uncommitted changes: got %q, want %q",
+			string(content), "dirty parent\n")
+	}
+}
+
+// TestDirtyParent_WorktreeSeesUntrackedFiles verifies that non-ignored
+// untracked files in the parent are present in the worktree.
+func TestDirtyParent_WorktreeSeesUntrackedFiles(t *testing.T) {
+	dir := setupGitRepo(t)
+	app := newWorktreeTestApp(t, dir)
+
+	// Create an untracked file in the parent.
+	if err := os.WriteFile(filepath.Join(dir, "untracked.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	wtDir, err := createWorktree(context.Background(), app)
+	if err != nil {
+		t.Fatalf("createWorktree: %v", err)
+	}
+	defer removeWorktree(context.Background(), app, wtDir)
+
+	// The worktree should have the untracked file.
+	content, err := os.ReadFile(filepath.Join(wtDir, "untracked.go"))
+	if err != nil {
+		t.Fatalf("worktree should have parent's untracked file: %v", err)
+	}
+	if string(content) != "package main\n" {
+		t.Errorf("untracked file content mismatch: got %q, want %q", string(content), "package main\n")
+	}
+}
+
+// TestDirtyParent_NoOpChildEmptyPatch verifies the critical invariant: a
+// no-op child (no edits) produces an EMPTY patch even when the parent is
+// dirty. This is the key correctness property — without it, every child of a
+// dirty parent would produce a spurious patch containing the parent's own
+// changes.
+func TestDirtyParent_NoOpChildEmptyPatch(t *testing.T) {
+	dir := setupGitRepo(t)
+	app := newWorktreeTestApp(t, dir)
+
+	// Make the parent dirty: modify a tracked file + add an untracked file.
+	if err := os.WriteFile(filepath.Join(dir, "hello.txt"), []byte("dirty parent\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "new.txt"), []byte("untracked\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	wtDir, err := createWorktree(context.Background(), app)
+	if err != nil {
+		t.Fatalf("createWorktree: %v", err)
+	}
+	defer removeWorktree(context.Background(), app, wtDir)
+
+	// Child does nothing — just diff.
+	diff, err := diffWorktree(context.Background(), app, wtDir)
+	if err != nil {
+		t.Fatalf("diffWorktree: %v", err)
+	}
+	if diff != "" {
+		t.Errorf("no-op child on dirty parent should produce empty patch; got:\n%s", diff)
+	}
+}
+
+// TestDirtyParent_ChildEditOnDirtyFileAppliesCleanly verifies that a child
+// editing a file the parent has already dirtied produces a patch containing
+// ONLY the child's delta, and it applies cleanly to the parent.
+func TestDirtyParent_ChildEditOnDirtyFileAppliesCleanly(t *testing.T) {
+	dir := setupGitRepo(t)
+	app := newWorktreeTestApp(t, dir)
+
+	// Parent dirties hello.txt.
+	if err := os.WriteFile(filepath.Join(dir, "hello.txt"), []byte("parent changed line 1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	wtDir, err := createWorktree(context.Background(), app)
+	if err != nil {
+		t.Fatalf("createWorktree: %v", err)
+	}
+	defer removeWorktree(context.Background(), app, wtDir)
+
+	// Child further edits hello.txt (on top of the parent's dirty version).
+	if err := os.WriteFile(filepath.Join(wtDir, "hello.txt"), []byte("parent changed line 1\nchild added line 2\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Diff should contain only the child's delta.
+	diff, err := diffWorktree(context.Background(), app, wtDir)
+	if err != nil {
+		t.Fatalf("diffWorktree: %v", err)
+	}
+	if diff == "" {
+		t.Fatal("patch should not be empty after child edit")
+	}
+	// The diff should NOT contain the parent's original change — only the
+	// child's addition.
+	if strings.Contains(diff, "child added line 2") == false {
+		t.Errorf("patch should contain child's new line: %s", diff)
+	}
+
+	// Apply to the parent — should apply cleanly (the baseline includes the
+	// parent's dirty state).
+	patchApplyMu.Lock()
+	applied, conflict, errMsg := applyPatch(context.Background(), app, diff)
+	patchApplyMu.Unlock()
+	if !applied {
+		t.Fatalf("patch should apply cleanly (conflict=%v): %s", conflict, errMsg)
+	}
+
+	// Verify the parent now has both the parent's and child's changes.
+	content, err := os.ReadFile(filepath.Join(dir, "hello.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "parent changed line 1\nchild added line 2\n" {
+		t.Errorf("parent should have merged content: got %q", string(content))
+	}
+}
+
+// TestDirtyParent_IgnoredFilesNotInWorktree verifies that .gitignore'd files
+// are NOT copied into the worktree.
+func TestDirtyParent_IgnoredFilesNotInWorktree(t *testing.T) {
+	dir := setupGitRepo(t)
+	app := newWorktreeTestApp(t, dir)
+
+	// Create a .gitignore and an ignored file.
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("*.log\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "debug.log"), []byte("log content\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	wtDir, err := createWorktree(context.Background(), app)
+	if err != nil {
+		t.Fatalf("createWorktree: %v", err)
+	}
+	defer removeWorktree(context.Background(), app, wtDir)
+
+	// .gitignore is non-ignored, so it should be in the worktree.
+	if _, err := os.Stat(filepath.Join(wtDir, ".gitignore")); err != nil {
+		t.Errorf(".gitignore should be in worktree (it's tracked/non-ignored): %v", err)
+	}
+
+	// debug.log is ignored, so it should NOT be in the worktree.
+	if _, err := os.Stat(filepath.Join(wtDir, "debug.log")); err == nil {
+		t.Error("debug.log should NOT be in worktree (it's .gitignore'd)")
+	}
+}
+
+// TestDirtyParent_ParentIndexUntouched verifies that creating a worktree from
+// a dirty parent does not modify the parent's git index.
+func TestDirtyParent_ParentIndexUntouched(t *testing.T) {
+	dir := setupGitRepo(t)
+	app := newWorktreeTestApp(t, dir)
+
+	// Make the parent dirty.
+	if err := os.WriteFile(filepath.Join(dir, "hello.txt"), []byte("dirty\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Capture the parent's index state before worktree creation.
+	cmd := osexec.Command("git", "-C", dir, "status", "--porcelain=v1")
+	before, _ := cmd.CombinedOutput()
+
+	wtDir, err := createWorktree(context.Background(), app)
+	if err != nil {
+		t.Fatalf("createWorktree: %v", err)
+	}
+	defer removeWorktree(context.Background(), app, wtDir)
+
+	// The parent's status should be unchanged — the snapshot used a temp index.
+	cmd = osexec.Command("git", "-C", dir, "status", "--porcelain=v1")
+	after, _ := cmd.CombinedOutput()
+	if string(before) != string(after) {
+		t.Errorf("parent git status changed after worktree creation:\nbefore: %s\nafter: %s",
+			string(before), string(after))
+	}
+}
+
+// TestDirtyParent_EndToEnd_SiblingPatchVisibleToNextChild verifies that after
+// a sibling child's patch is applied, a subsequent worktree sees the patched
+// state (sibling patches are visible to later children).
+func TestDirtyParent_EndToEnd_SiblingPatchVisibleToNextChild(t *testing.T) {
+	dir := setupGitRepo(t)
+	app := newWorktreeTestApp(t, dir)
+
+	// Child 1: edit hello.txt.
+	wtDir1, err := createWorktree(context.Background(), app)
+	if err != nil {
+		t.Fatalf("createWorktree 1: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wtDir1, "hello.txt"), []byte("sibling 1 edit\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	diff1, _ := diffWorktree(context.Background(), app, wtDir1)
+	patchApplyMu.Lock()
+	applied1, _, _ := applyPatch(context.Background(), app, diff1)
+	patchApplyMu.Unlock()
+	if !applied1 {
+		t.Fatal("sibling 1 patch should apply")
+	}
+	removeWorktree(context.Background(), app, wtDir1)
+
+	// Child 2: create worktree AFTER sibling 1's patch was applied.
+	wtDir2, err := createWorktree(context.Background(), app)
+	if err != nil {
+		t.Fatalf("createWorktree 2: %v", err)
+	}
+	defer removeWorktree(context.Background(), app, wtDir2)
+
+	// The worktree should see sibling 1's edit, not the original HEAD content.
+	content, err := os.ReadFile(filepath.Join(wtDir2, "hello.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "sibling 1 edit\n" {
+		t.Errorf("child 2 should see sibling 1's applied patch: got %q, want %q",
+			string(content), "sibling 1 edit\n")
+	}
+}
