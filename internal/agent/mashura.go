@@ -173,8 +173,13 @@ func (a *App) handleMashura(ctx context.Context, name string, tc proxy.ToolCall)
 // fallback, subagents); sync=false enqueues the panel on the async registry
 // and returns a placeholder pointing at the op id.
 func (a *App) runMashuraCore(ctx context.Context, name string, tc proxy.ToolCall, sync bool) string {
-	// Consume the auto-counsel skip-gate flag at the very top so it can't leak
-	// on early error returns (resolvePanel/key errors).
+	// Consume the auto-counsel skip-gate flag BEFORE any code that can return
+	// early with an error. Previously this was consumed after resolvePanel and
+	// mashuraPanelKeys, which meant a panel/key error would skip the clearing
+	// and leave the flag set for the next call — a leak that could bypass the
+	// confirm gate on a subsequent unrelated call. Moving it to the very first
+	// line guarantees the flag is always consumed exactly once per invocation,
+	// regardless of which error path is taken.
 	skipGate := a.autoCounselSkipGate
 	a.autoCounselSkipGate = false
 

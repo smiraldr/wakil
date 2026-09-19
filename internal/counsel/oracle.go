@@ -21,14 +21,20 @@ import (
 const oracleEndpoint = "https://api.anthropic.com/v1/messages"
 
 // counselClient is a shared HTTP client with transport-level timeouts. The
-// request context carries the primary deadline (context.WithTimeout), but
-// the transport adds dial, TLS-handshake, and response-header deadlines so
-// a hung connection is caught even if the context timeout is removed.
+// request context carries the primary deadline (context.WithTimeout), which
+// bounds the full request including server-side tool execution. The transport
+// adds dial and TLS-handshake deadlines so a hung connection is caught even
+// if the context timeout is removed.
+//
+// ResponseHeaderTimeout is intentionally NOT set: for non-streaming calls,
+// the server can't send response headers until the full response is ready.
+// Mashūra calls with server-side tools (web_search, web_fetch) can legitimately
+// take several minutes. The context deadline (default 300s, configurable via
+// oracle_timeout_seconds) is the proper upper bound.
 var counselClient = func() *http.Client {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.DialContext = (&net.Dialer{Timeout: 10 * time.Second}).DialContext
 	tr.TLSHandshakeTimeout = 10 * time.Second
-	tr.ResponseHeaderTimeout = 30 * time.Second
 	return &http.Client{Transport: tr}
 }()
 
