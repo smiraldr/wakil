@@ -82,11 +82,12 @@ type subagentState struct {
 	subMaxToolIter int
 
 	// Phase 1: GLOBAL subagent concurrency cap across ALL overlapping
-	// batches (synchronous + async discovery). Sized lazily by MaxParallelSubagents;
-	// bounded by a wire in runSubagentJobs so total concurrent children never
-	// exceeds /maxpar even when async batches detach and overlap. nil until first use.
+	// batches (synchronous + async discovery). Sized lazily from the unclamped
+	// Cfg.MaxParallelSubagents on the first batch; never resized afterward.
+	// A /maxpar change after the first batch updates per-batch dispatch logic
+	// (announcement, wave timeout) but not this semaphore. nil until first use.
 	subagentGlobalSem chan struct{}
-	// subagentSemMu guards lazy (re)size of subagentGlobalSem.
+	// subagentSemMu guards lazy initialization of subagentGlobalSem.
 	subagentSemMu sync.Mutex
 
 	// subagentLimitsCachePtr backs a singleflight cache for context-limit

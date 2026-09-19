@@ -26,20 +26,28 @@ import (
 )
 
 // ensureSubagentGlobalSem returns the App's GLOBAL subagent concurrency semaphore,
-// creating it lazily at the requested size (maxPar = the effective /maxpar cap).
-// The global sem bounds total concurrent subagent children across ALL overlapping
-// batches (synchronous AND detached async discovery), so a batch's own /maxpar
-// clamp is respected globally. Sized once; a later larger maxPar cannot grow the
-// channel (the clamp is already applied at admission inside runSubagentJobs, and
-// re-homestzing here is best-effort). Safe to call concurrently.
+// creating it lazily at the requested size (maxPar = the unclamped /maxpar config
+// value). The global sem bounds total concurrent subagent children across ALL
+// overlapping batches (synchronous AND detached async discovery), so a batch's
+// own /maxpar clamp is respected globally.
+//
+// The channel is created once and NEVER replaced: a later /maxpar change updates
+// Cfg.MaxParallelSubagents (used for per-batch dispatch decisions like the
+// announcement display and batch timeout wave calculation) but does not resize
+// the global semaphore. This is the documented semantics: the global concurrency
+// bound is fixed for the session lifetime once the first batch initializes it.
+// Replacing the channel while workers hold slots in the old one would split
+// admissions across two independent channels and violate the cap.
+//
+// Callers must pass the UNCLAMPED config value (not job-clamped) so a first small
+// batch doesn't permanently limit all future batches. Safe to call concurrently.
 func (a *App) ensureSubagentGlobalSem(maxPar int) chan struct{} {
-	// Fast path: already sized to at least the requested cap.
-	if s := a.subagentGlobalSem; s != nil && cap(s) >= maxPar {
-		return s
-	}
 	a.subagentSemMu.Lock()
 	defer a.subagentSemMu.Unlock()
-	if a.subagentGlobalSem == nil || cap(a.subagentGlobalSem) < maxPar {
+	if a.subagentGlobalSem == nil {
+		if maxPar < 1 {
+			maxPar = 1
+		}
 		a.subagentGlobalSem = make(chan struct{}, maxPar)
 	}
 	return a.subagentGlobalSem

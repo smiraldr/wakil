@@ -144,15 +144,14 @@ func (a *App) runSubagentJobs(ctx context.Context, jobs []subagentJob, backend s
 	if maxPar < 1 {
 		maxPar = 1
 	}
-	// Clamp to job count: a huge config value (e.g. /maxpar 64 with 2 jobs)
-	// would allocate an oversized semaphore for no benefit.
-	if maxPar > len(jobs) {
-		maxPar = len(jobs)
-	}
 	// Phase 1: the GLOBAL semaphore bounds total concurrent subagent
 	// children ACROSS all overlapping batches (incl. detached async discovery),
 	// not just within this invocation — so async batches cannot balloon
-	// parallelism beyond /maxpar. Sized once by maxPar.
+	// parallelism beyond /maxpar. Sized once from the unclamped config cap;
+	// never resized afterward. The per-batch clamp to len(jobs) is applied
+	// at the announceSubagentBlock display layer, not here — passing the
+	// unclamped value ensures a first small batch doesn't permanently
+	// limit all future batches.
 	sem := a.ensureSubagentGlobalSem(maxPar)
 	var wg sync.WaitGroup
 	for i := range jobs {
