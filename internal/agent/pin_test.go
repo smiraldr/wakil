@@ -287,7 +287,7 @@ func TestForceFinishSetsExhaustedFlag(t *testing.T) {
 		Out:           io.Discard,
 		IsSubagent:    true,
 		subagentState: subagentState{pinUserMessage: true},
-		ToolCache:     map[string]bool{},
+		ToolCache:     map[string]*toolDedupEntry{},
 	}
 	sub.Conv = []proxy.Message{{Role: "system", Content: StrPtr(subagentSystemPrompt), Pinned: true}}
 
@@ -650,7 +650,7 @@ func TestExhaustedResetOnSend(t *testing.T) {
 		Out:           io.Discard,
 		IsSubagent:    true,
 		subagentState: subagentState{pinUserMessage: true, exhausted: true}, // pre-set to verify it's reset
-		ToolCache:     map[string]bool{},
+		ToolCache:     map[string]*toolDedupEntry{},
 	}
 	sub.Conv = []proxy.Message{{Role: "system", Content: StrPtr(subagentSystemPrompt), Pinned: true}}
 

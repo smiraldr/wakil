@@ -412,6 +412,22 @@ func (a *App) streamTurn(ctx context.Context, userText string, rsink proxy.Sink,
 			a.stateMu.RUnlock()
 			if !rawTools {
 				text = a.CapOrStub(text, tc.Function.Name, turnToolBytes)
+				// After capping, if the result was spilled to disk, update the
+				// dedup entry with the spill path so future dedup hits can
+				// point the child at the recoverable content. Only updates an
+				// existing entry — never creates one — so the parallel-block
+				// path (which bypasses handleToolCall) doesn't populate the
+				// cache. The extraction is inside !rawTools because RawTools
+				// bypasses CapOrStub entirely — running it outside would
+				// extract spill markers from arbitrary tool output text.
+				if a.ToolCache != nil {
+					key := a.toolDedupKey(tc.Function.Name, tc.Function.Arguments)
+					if entry, ok := a.ToolCache[key]; ok && entry != nil {
+						if sp := wtools.ExtractSpillPath(text); sp != "" {
+							entry.spillPath = sp
+						}
+					}
+				}
 			}
 			// Track the first iteration where turnBudgetStubbed fires, for the
 			// stop-on-stub grace window. First stub wins (sentinel -1 = not yet).

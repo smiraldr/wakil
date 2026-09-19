@@ -58,7 +58,7 @@ func TestStopOnStubForcesFinish(t *testing.T) {
 			pinUserMessage:        true,
 			turnBudgetStubbedIter: -1,
 		},
-		ToolCache: map[string]bool{},
+		ToolCache: map[string]*toolDedupEntry{},
 	}
 	sub.Conv = []proxy.Message{{Role: "system", Content: StrPtr(subagentSystemPrompt), Pinned: true}}
 
@@ -131,7 +131,7 @@ func TestStopOnStubGraceWindow(t *testing.T) {
 			pinUserMessage:        true,
 			turnBudgetStubbedIter: -1,
 		},
-		ToolCache: map[string]bool{},
+		ToolCache: map[string]*toolDedupEntry{},
 	}
 	sub.Conv = []proxy.Message{{Role: "system", Content: StrPtr(subagentSystemPrompt), Pinned: true}}
 
@@ -194,7 +194,7 @@ func TestBudgetVisibilityMessageInjected(t *testing.T) {
 			pinUserMessage:        true,
 			turnBudgetStubbedIter: -1,
 		},
-		ToolCache: map[string]bool{},
+		ToolCache: map[string]*toolDedupEntry{},
 	}
 	sub.Conv = []proxy.Message{{Role: "system", Content: StrPtr(subagentSystemPrompt), Pinned: true}}
 

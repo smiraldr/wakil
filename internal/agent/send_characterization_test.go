@@ -426,7 +426,7 @@ func TestExecuteToolCall_ToolCache_Dedup(t *testing.T) {
 		Out:       io.Discard,
 		Confirm:   func(_, _, _ string, _ bool) bool { return true },
 		Cfg:       config.DefaultConfig(),
-		ToolCache: map[string]bool{},
+		ToolCache: map[string]*toolDedupEntry{},
 	}
 
 	r1 := app.handleToolCall(context.Background(), proxy.ToolCall{Function: proxy.FunctionCall{

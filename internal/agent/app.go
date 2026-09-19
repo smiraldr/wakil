@@ -245,8 +245,14 @@ type App struct {
 
 	// ToolCache, when non-nil, deduplicates tool calls within the session.
 	// A repeated (name, args) pair returns a short notice instead of re-executing.
-	// Enabled for subagents (which should never need to read the same file twice).
-	ToolCache map[string]bool
+	// Enabled for subagents. Each entry stores the spill path (for content recovery
+	// after compaction/eviction) and the normalized path arg (for edit invalidation
+	// — when a file is edited, all cache entries for that path are invalidated so
+	// the child re-reads the updated content).
+	// Turn-goroutine only: all access (handleToolCall, finalizeToolResult,
+	// recordFileChanged) runs on the turn goroutine. No lock needed — no
+	// async/RPC path touches this map.
+	ToolCache map[string]*toolDedupEntry
 
 	// OnTokRate, when set, receives a live token/sec estimate of the assistant's
 	// decode speed during streaming (output chars ÷ 4 ÷ elapsed). Set only for the
@@ -1682,6 +1688,21 @@ func (a *App) evictStaleToolResults() {
 	}
 }
 
+// toolDedupEntry records metadata about a successfully cached tool call.
+// spillPath is the on-disk spill path (extracted from CapOrStub output) the
+// child can read_file to recover the original content after compaction or
+// eviction has removed the tool-result message from its conversation. Empty
+// when the result was small enough to pass through uncapped (no spill
+// created), or when RawTools bypassed capping, or when the spill failed.
+// path is the normalized path argument (from toolDedupKey) used for
+// edit invalidation: when an edit tool succeeds, all entries whose path
+// matches the edited canonical are removed so the child re-reads updated
+// content. Empty for tools with no path argument.
+type toolDedupEntry struct {
+	spillPath string
+	path      string
+}
+
 // toolDedupKey builds a normalized cache key for (tool, args). Path arguments
 // are resolved to an absolute, cleaned form so ".", "./", "/work" and trailing
 // slashes all collapse to one entry; marshaling the parsed map also makes the
@@ -1711,10 +1732,76 @@ func (a *App) normPath(p string) string {
 	return filepath.Clean(p)
 }
 
+// extractPathArg extracts and normalizes the "path" argument from a tool call's
+// JSON arguments, returning the same normalized form used in toolDedupKey.
+// Returns "" when the tool has no path argument or the argument is empty.
+// Used to populate toolDedupEntry.path for edit invalidation — the normalized
+// path allows invalidation by matching against canonical edit paths without
+// parsing cache keys.
+func (a *App) extractPathArg(name, argsJSON string) string {
+	var m map[string]interface{}
+	if json.Unmarshal([]byte(argsJSON), &m) != nil {
+		return ""
+	}
+	p, ok := m["path"].(string)
+	if !ok || p == "" {
+		return ""
+	}
+	return a.normPath(p)
+}
+
+// invalidateCachedPath removes all ToolCache entries whose normalized path
+// matches the given canonical path, OR whose normalized path is an ancestor
+// directory of the canonical path. Called after a successful edit-category
+// tool call so the child re-reads updated content instead of getting a
+// stale "already called" dedup hit. Invalidates ALL cached tools for the
+// path — not just read_file — because search_files, list_dir, find_files,
+// etc. are equally stale after a file mutation. The ancestor check catches
+// directory-scoped tools (search_files{path:"."}, list_dir{path:"."}) whose
+// entry.path is the workspace root, not the edited file. No-op when
+// ToolCache is nil (parent, or subagent without dedup). Turn-goroutine only.
+func (a *App) invalidateCachedPath(canonical string) {
+	if a.ToolCache == nil || canonical == "" {
+		return
+	}
+	normalized := a.normPath(canonical)
+	for key, entry := range a.ToolCache {
+		if entry == nil {
+			continue
+		}
+		// Exact match: the entry's path is the edited file.
+		if entry.path == normalized {
+			delete(a.ToolCache, key)
+			continue
+		}
+		// Ancestor match: the entry's path is a parent directory of the
+		// edited file (e.g. search_files{path:"."} has entry.path="/work",
+		// editing "/work/a.go" should invalidate it).
+		if entry.path != "" && isPathAncestor(entry.path, normalized) {
+			delete(a.ToolCache, key)
+		}
+	}
+}
+
+// isPathAncestor reports whether ancestor is a directory ancestor of path
+// (e.g. "/work" is an ancestor of "/work/a.go"). Both must be cleaned paths.
+func isPathAncestor(ancestor, path string) bool {
+	if ancestor == "" || path == "" {
+		return false
+	}
+	// Ensure ancestor doesn't have trailing slash (normPath already cleans,
+	// but belt-and-suspenders).
+	ancestor = strings.TrimSuffix(ancestor, "/")
+	return strings.HasPrefix(path, ancestor+"/")
+}
+
 // recordFileChanged appends a canonical path to the filesChanged recorder when
 // the App has one (edit-tier subagents). No-op for the parent and discovery-tier
 // children (filesChanged is nil). Called after a successful edit-category tool call.
+// Also invalidates all ToolCache entries for the edited path so the child
+// re-reads updated content instead of getting a stale "already called" hit.
 func (a *App) recordFileChanged(canonical string) {
+	a.invalidateCachedPath(canonical)
 	if a.filesChanged != nil {
 		a.filesChanged.record(canonical)
 	}
@@ -1821,8 +1908,17 @@ func (a *App) handleToolCall(ctx context.Context, tc proxy.ToolCall) toolResult 
 	var cacheKey string
 	if a.ToolCache != nil {
 		cacheKey = a.toolDedupKey(name, tc.Function.Arguments)
-		if a.ToolCache[cacheKey] {
-			return errResult(fmt.Sprintf("[already called %s with equivalent arguments — that result is already above. Do not repeat it: use what you have, try a different path/pattern, or produce your final answer.]", name))
+		if entry, hit := a.ToolCache[cacheKey]; hit {
+			// Build a recovery-aware dedup message. If the original result
+			// spilled to disk, point the child at the spill path so it can
+			// read_file the content instead of re-executing the tool.
+			// Fall back to the generic message when no spill path is
+			// available (small uncapped results, RawTools, spill failure).
+			msg := fmt.Sprintf("[already called %s with equivalent arguments — do not repeat it: use what you have, try a different path/pattern, or produce your final answer.]", name)
+			if entry != nil && entry.spillPath != "" {
+				msg = fmt.Sprintf("[already called %s with equivalent arguments — do not repeat it. The original result was spilled to: %s — use read_file to recover it if needed, otherwise use what you have.]", name, entry.spillPath)
+			}
+			return errResult(msg)
 		}
 	}
 
@@ -1879,7 +1975,12 @@ func (a *App) handleToolCall(ctx context.Context, tc proxy.ToolCall) toolResult 
 	a.recordRecentTrace(tc, result)
 
 	if cacheKey != "" && result.ok {
-		a.ToolCache[cacheKey] = true
+		// Extract the normalized path from the cache key for edit invalidation.
+		// toolDedupKey stores path as a normalized absolute path in the JSON;
+		// extractPathArg pulls it back out. Empty for tools with no path arg.
+		a.ToolCache[cacheKey] = &toolDedupEntry{
+			path: a.extractPathArg(name, tc.Function.Arguments),
+		}
 	}
 	return result
 }

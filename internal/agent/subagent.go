@@ -1324,7 +1324,7 @@ func (a *App) dispatchSubagent(ctx context.Context, task string, progressOut io.
 		Confirm:       childConfirmer,
 		Out:           progressOut,
 		Session:       nil,
-		ToolCache:     map[string]bool{},
+		ToolCache:     map[string]*toolDedupEntry{},
 		IsSubagent:    true,
 		AgentPrefix:   "sub-" + ShortID(subChatID),
 		StagingClient: a.StagingClient, // shared — kvr client is thread-safe

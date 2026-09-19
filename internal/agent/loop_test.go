@@ -133,7 +133,7 @@ func TestToolDedupKeyNormalizes(t *testing.T) {
 func TestToolDedupHitOnEquivalentPath(t *testing.T) {
 	exec := newFakeExecutor()
 	exec.files["a.go"] = "content"
-	app := &App{Exec: exec, ToolCache: map[string]bool{}, Out: io.Discard}
+	app := &App{Exec: exec, ToolCache: map[string]*toolDedupEntry{}, Out: io.Discard}
 
 	r1 := app.handleToolCall(context.Background(), proxy.ToolCall{Function: proxy.FunctionCall{Name: "read_file", Arguments: `{"path":"a.go"}`}})
 	if strings.Contains(r1.text, "already called") {
