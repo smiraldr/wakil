@@ -2142,11 +2142,30 @@ func renderReasoning(text string, w int, expanded bool) string {
 	return lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Italic(true).Render(wrapped)
 }
 
+// sizes returns the layout dimensions using the current effective status row
+// count. It is the backward-compatible wrapper around sizesWithStatusHeight,
+// used by reflow(), event handlers, and tests. View() calls
+// sizesWithStatusHeight directly with a pre-computed row count to avoid a
+// redundant statusLines() call (see View's doc comment).
 func (m tuiModel) sizes() (vpW, vpH, inputOuterH int) {
+	return m.sizesWithStatusHeight(m.effectiveStatusRows())
+}
+
+// sizesWithStatusHeight computes layout dimensions given a pre-computed
+// effective status row count (0 when the status zone is hidden). This allows
+// View() to compute statusLines() once and pass len(lines) here for layout,
+// then reuse the same lines for rendering — avoiding a duplicate facade.Info()
+// + Consent() + segment-rendering pass per frame.
+//
+// The parameter is the effective rendered status-row count, NOT statusRows()
+// — it is 0 when hidden, otherwise len(statusLines()). sizes() delegates here
+// with effectiveStatusRows(), which applies the same visibility gate.
+func (m tuiModel) sizesWithStatusHeight(statusH int) (vpW, vpH, inputOuterH int) {
 	// Input box = border (borderH) + textarea; the status line sits directly
-	// above it (1–2 rows, content-dependent — statusRows() is the single
-	// source of truth shared with View()).
-	inputOuterH = m.ta.Height() + borderH + m.effectiveStatusRows()
+	// above it (0–5 rows, content-dependent — the caller supplies the count:
+	// 0 when hidden, otherwise tool-activity row (0–1) + flowSegmentsN rows
+	// (1–2 collapsed, 1–4 expanded)).
+	inputOuterH = m.ta.Height() + borderH + statusH
 	tabH := 0
 	if len(m.subTabs) > 0 {
 		tabH = 1

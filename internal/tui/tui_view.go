@@ -180,14 +180,28 @@ func brailleMeter(used, total int, color lipgloss.Color, half int, leftLabel, ri
 	return b.String()
 }
 
-// View renders the full-screen TUI. Dimensions come from sizes() so this
-// function and reflow() always agree on layout math.
+// View renders the full-screen TUI. Dimensions come from sizesWithStatusHeight
+// (passed a pre-computed status row count) so this function and reflow() always
+// agree on layout math: both derive the status height from statusLines() —
+// reflow() via sizes() → effectiveStatusRows(), View() directly via len().
 func (m tuiModel) View() string {
 	if !m.ready {
 		return "initializing…\n"
 	}
 
-	vpW, vpH, inputOuterH := m.sizes()
+	// Compute status lines once per frame when visible. sizesWithStatusHeight
+	// needs the row count for layout; View() needs the rendered lines for
+	// display. Computing them once and passing the count avoids a redundant
+	// statusLines() call (which triggers facade.Info() + Consent() + segment
+	// rendering). When the status zone is hidden (splash screen), zero calls
+	// are made — preserving the pre-existing zero-call behavior.
+	visible := m.statusVisible()
+	var statusZone []string
+	if visible {
+		statusZone = m.statusLines()
+	}
+
+	vpW, vpH, inputOuterH := m.sizesWithStatusHeight(len(statusZone))
 	_ = inputOuterH // used implicitly via JoinVertical
 
 	// --- conversation pane ---
@@ -229,10 +243,10 @@ func (m tuiModel) View() string {
 	// The "@"/"/" completion picker or the resume picker sits between the
 	// conversation and the input — the two are mutually exclusive (opening
 	// the resume picker closes the completion picker; see openResumePicker).
-	// The status line (statusRows() is the single source of truth for its
-	// height) sits directly above the input; the tab bar (when sub tabs
-	// exist) is below it. The former info panel is now extra segments inside
-	// the status line (F2 / ctrl+o), not a separate region.
+	// The status line (pre-computed above; its row count drives layout via
+	// sizesWithStatusHeight) sits directly above the input; the tab bar (when
+	// sub tabs exist) is below it. The former info panel is now extra segments
+	// inside the status line (F2 / ctrl+o), not a separate region.
 	var sections []string
 	sections = append(sections, top)
 	if m.resumePicker.active {
@@ -246,8 +260,8 @@ func (m tuiModel) View() string {
 	// visible — clean, no chrome. The status line appears once the first
 	// turn is submitted, with zero rearrangement of the textarea (it was
 	// already at the bottom).
-	if m.statusVisible() {
-		sections = append(sections, lipgloss.NewStyle().Width(m.width-borderW).Render(strings.Join(m.statusLines(), "\n")))
+	if visible {
+		sections = append(sections, lipgloss.NewStyle().Width(m.width-borderW).Render(strings.Join(statusZone, "\n")))
 	}
 	sections = append(sections, input)
 	if len(m.subTabs) > 0 {
