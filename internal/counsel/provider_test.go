@@ -562,15 +562,16 @@ func TestRunPanelDebateRound1FailureDropsMember(t *testing.T) {
 	if callsA != 1 {
 		t.Errorf("model-a: expected 1 call (round 1 only, failed), got %d", callsA)
 	}
-	// model-b should be called twice (round 1 + round 2).
-	if callsB != 2 {
-		t.Errorf("model-b: expected 2 calls, got %d", callsB)
+	// model-b should be called once (round 1 only — with 1 successful member,
+	// round 2 self-critique is skipped as pointless).
+	if callsB != 1 {
+		t.Errorf("model-b: expected 1 call (round 1 only, round 2 skipped for n=1), got %d", callsB)
 	}
 	// Result 0 (model-a) should have an error.
 	if results[0].Err == nil {
 		t.Error("model-a: expected an error from round 1 failure")
 	}
-	// Result 1 (model-b) should have a round-2 answer.
+	// Result 1 (model-b) should have a round-1 answer (no round 2).
 	if results[1].Err != nil {
 		t.Errorf("model-b: unexpected error: %v", results[1].Err)
 	}
@@ -644,22 +645,18 @@ func TestRunPanelDebateMaxParticipants(t *testing.T) {
 	}
 }
 
-// TestRunPanelDebateSingleMember verifies that debate mode works with a
-// single member (round 2 still runs, the member critiques itself).
+// TestRunPanelDebateSingleMember verifies that debate mode with a single
+// successful member skips round 2 (self-critique without a second perspective
+// is paid and pointless). Only 1 call should be made (round 1 only).
 func TestRunPanelDebateSingleMember(t *testing.T) {
 	var mu sync.Mutex
 	callCount := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		callCount++
-		n := callCount
 		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		if n == 1 {
-			w.Write([]byte(`{"content":[{"type":"text","text":"initial answer"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`))
-		} else {
-			w.Write([]byte(`{"content":[{"type":"text","text":"refined answer"}],"stop_reason":"end_turn","usage":{"input_tokens":15,"output_tokens":7}}`))
-		}
+		w.Write([]byte(`{"content":[{"type":"text","text":"initial answer"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`))
 	}))
 	defer srv.Close()
 
@@ -672,8 +669,8 @@ func TestRunPanelDebateSingleMember(t *testing.T) {
 	mu.Lock()
 	got := callCount
 	mu.Unlock()
-	if got != 2 {
-		t.Errorf("expected 2 calls (round 1 + round 2), got %d", got)
+	if got != 1 {
+		t.Errorf("expected 1 call (round 1 only, round 2 skipped for n=1), got %d", got)
 	}
 	if len(results) != 1 {
 		t.Fatalf("want 1 result, got %d", len(results))
@@ -681,8 +678,8 @@ func TestRunPanelDebateSingleMember(t *testing.T) {
 	if results[0].Err != nil {
 		t.Errorf("unexpected error: %v", results[0].Err)
 	}
-	if results[0].Answer != "refined answer" {
-		t.Errorf("answer = %q, want 'refined answer'", results[0].Answer)
+	if results[0].Answer != "initial answer" {
+		t.Errorf("answer = %q, want 'initial answer' (round-1 result, no round 2)", results[0].Answer)
 	}
 }
 
@@ -774,17 +771,24 @@ func TestRunPanelDebateRound2SurvivesWith2xDeadline(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		models := []string{"anthropic:model-a"}
+		// Two models are needed to trigger round 2 (with n=1, round 2 is skipped).
+		models := []string{"anthropic:model-a", "anthropic:model-b"}
 		apiKeys := map[string]string{"anthropic": "test-key"}
 		ccfg := PanelCallConfig{MaxTokens: 256, TimeoutSeconds: perCall, AnthropicEndpoint: srv.URL + "/v1/messages"}
 
 		parent, cancel := context.WithTimeout(context.Background(), outerDeadline)
 		defer cancel()
 		results := RunPanel(parent, models, "debate", "question?", "briefing", ccfg, apiKeys)
-		if len(results) != 1 {
-			t.Fatalf("want 1 result, got %d", len(results))
+		if len(results) != 2 {
+			t.Fatalf("want 2 results, got %d", len(results))
 		}
-		return results[0].Answer, results[0].Err
+		// Return the first successful result.
+		for _, r := range results {
+			if r.Err == nil {
+				return r.Answer, nil
+			}
+		}
+		return "", results[0].Err
 	}
 
 	// Pre-fix behavior (outer deadline clipped to 1×): round 2 is cancelled.

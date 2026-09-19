@@ -582,11 +582,49 @@ func (a *App) mashuraPlanSections(ctx context.Context) (findings, plan string) {
 
 // mashuraCap tail-truncates an assembled tool briefing to mashuraToolBriefingCap.
 // This is larger than the WF oracle cap — tool calls can attach full source files.
+//
+// If the briefing contains a Sources section, the tail-truncation would drop the
+// evidence first (Sources are appended last). To avoid this, we split on the
+// Sources header and truncate the non-sources portion separately, preserving
+// as much evidence as fits within the overall cap.
 func mashuraCap(s string) string {
 	if len(s) <= mashuraToolBriefingCap {
 		return s
 	}
-	return s[:mashuraToolBriefingCap] + "\n[briefing truncated at overall cap]"
+	// The Sources header is "## Sources (read by Wakil)\n" — match on the
+	// stable prefix "## Sources" to find where evidence begins.
+	const marker = "## Sources"
+	idx := strings.Index(s, marker)
+	if idx < 0 {
+		// No Sources section — simple tail truncation.
+		return s[:mashuraToolBriefingCap] + "\n[briefing truncated at overall cap]"
+	}
+	// Split into body (before Sources) and sources (from marker onward).
+	body := s[:idx]
+	sources := s[idx:]
+	// Reserve space for truncation notices (worst case: two notices ~60 bytes).
+	usable := mashuraToolBriefingCap - 80
+	bodyCap := usable * 6 / 10 // 60% to body
+	srcCap := usable - bodyCap // 40% to sources
+	if len(sources) <= srcCap {
+		// Sources fit — give the remainder to body.
+		bodyCap = usable - len(sources)
+	} else if len(body) <= bodyCap {
+		// Body fits — give the remainder to sources.
+		srcCap = usable - len(body)
+	}
+	var result string
+	if len(body) > bodyCap {
+		result = body[:bodyCap] + "\n[briefing body truncated]\n"
+	} else {
+		result = body
+	}
+	if len(sources) > srcCap {
+		result += sources[:srcCap] + "\n[sources truncated]"
+	} else {
+		result += sources
+	}
+	return result
 }
 
 // mashuraReview builds the review briefing: core + findings + plan + model focus
@@ -852,10 +890,13 @@ func (a *App) mashuraExpandPath(ctx context.Context, path string) (files []strin
 // (via git ls-files) and capping at mashuraDirFileCap files.
 func (a *App) mashuraExpandDir(ctx context.Context, dirPath string) ([]string, error) {
 	q := "'" + strings.ReplaceAll(dirPath, "'", `'\''`) + "'"
-	// git ls-files respects .gitignore; fall back to find if git is unavailable.
+	// git ls-files respects .gitignore; fall back to find ONLY if git fails
+	// (not if it succeeds with empty output — empty means no tracked files,
+	// which is a valid result, not a signal to bypass .gitignore with find).
 	cmd := `git ls-files --cached --others --exclude-standard -- ` + q + ` 2>/dev/null | sort`
 	out, err := a.Exec.RunShell(ctx, cmd)
-	if err != nil || strings.TrimSpace(out) == "" {
+	if err != nil {
+		// git failed (not in a repo, git not installed) — fall back to find.
 		cmd = `find ` + q + ` -type f ! -path '*/.git/*' ! -path '*/node_modules/*' | sort`
 		out, err = a.Exec.RunShell(ctx, cmd)
 		if err != nil {

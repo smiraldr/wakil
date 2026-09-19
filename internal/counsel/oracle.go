@@ -320,12 +320,17 @@ type PanelMemberEvent struct {
 
 // notifyMemberEvent invokes ccfg.OnMemberEvent nil-safely and recovers panics,
 // so UI telemetry can never alter a paid panel result or accounting. Callers
-// must not hold any counsel lock. May be called concurrently.
+// must not hold any counsel lock. May be called concurrently. Recovered panics
+// are logged to diag so they are not silently swallowed.
 func notifyMemberEvent(ccfg PanelCallConfig, ev PanelMemberEvent) {
 	if ccfg.OnMemberEvent == nil {
 		return
 	}
-	defer func() { _ = recover() }()
+	defer func() {
+		if r := recover(); r != nil {
+			diag.Printf("mashura: notifyMemberEvent panic recovered: %v", r)
+		}
+	}()
 	ccfg.OnMemberEvent(ev)
 }
 
@@ -480,8 +485,9 @@ type debateRound1Result struct {
 // (quoted, labeled) and produces a revised answer.
 //
 // Failed round-1 members drop out of round 2. Round-2 failures are included
-// as errors. The debate is successful if at least 1 member produced a
-// round-2 answer.
+// as errors. Round 2 is skipped when fewer than 2 members succeeded in round 1
+// (self-critique without a second perspective is not useful); in that case
+// round-1 results are returned directly.
 //
 // An overall deadline of 2× the per-call timeout prevents unbounded wall time.
 func runDebate(ctx context.Context, models []string, question, briefing string, ccfg PanelCallConfig, apiKeys map[string]string) []PanelMemberResult {
@@ -540,6 +546,11 @@ func runDebate(ctx context.Context, models []string, question, briefing string, 
 
 	// If all members failed in round 1, return round-1 results.
 	if len(successes) == 0 {
+		return r1Results
+	}
+	// With only 1 successful member, round 2 is a self-critique — paid and
+	// pointless without a second perspective to cross-examine. Return round-1.
+	if len(successes) < 2 {
 		return r1Results
 	}
 
@@ -746,11 +757,6 @@ func (m *orRespMessage) UnmarshalJSON(data []byte) error {
 // model decides when to call them, OpenRouter executes server-side, and the
 // final text is returned.
 func callOpenRouter(ctx context.Context, model, apiKey, question, briefing string, ccfg PanelCallConfig) (string, OracleUsage, error) {
-	endpoint := openRouterEndpoint
-	if ccfg.OpenRouterEndpoint != "" {
-		endpoint = ccfg.OpenRouterEndpoint
-	}
-
 	ctxLen := ResolveContextLength(ctx, model)
 	fit := FitToContext(oracleSystemPrompt, question, briefing, ccfg.MaxTokens, ctxLen)
 	if fit.CannotFit {
@@ -789,87 +795,13 @@ func callOpenRouter(ctx context.Context, model, apiKey, question, briefing strin
 		}
 	}
 
-	body, err := json.Marshal(req)
-	if err != nil {
-		return "", OracleUsage{}, fmt.Errorf("marshal: %w", err)
-	}
-
-	timeout := time.Duration(ccfg.TimeoutSeconds) * time.Second
-	if timeout <= 0 {
-		timeout = 300 * time.Second
-	}
-	tctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	raw, status, err := doJSONPost(tctx, endpoint, map[string]string{
-		"Authorization": "Bearer " + apiKey,
-	}, body)
-	if err != nil {
-		return "", OracleUsage{}, err
-	}
-
-	if status != http.StatusOK {
-		var apiErr orResp
-		if json.Unmarshal(raw, &apiErr) == nil && apiErr.Error != nil {
-			return "", OracleUsage{}, fmt.Errorf("openrouter: %d: %s", status, apiErr.Error.Message)
-		}
-		return "", OracleUsage{}, fmt.Errorf("openrouter: HTTP %d", status)
-	}
-
-	var result orResp
-	if err := json.Unmarshal(raw, &result); err != nil {
-		return "", OracleUsage{}, fmt.Errorf("parse response: %w", err)
-	}
-
-	// Extract usage immediately after successful decode — preserve it on all
-	// subsequent error paths so billed calls are accounted for.
-	var usage OracleUsage
-	if result.Usage != nil {
-		usage.InputTokens = int64(result.Usage.PromptTokens)
-		usage.OutputTokens = int64(result.Usage.CompletionTokens)
-		if result.Usage.ServerToolUse != nil {
-			usage.WebSearchRequests = int64(result.Usage.ServerToolUse.WebSearchRequests)
-		}
-	}
-
-	// Check for error object in 200 response (provider failures can return
-	// HTTP 200 with an error body).
-	if result.Error != nil {
-		return "", usage, fmt.Errorf("openrouter: %s", result.Error.Message)
-	}
-
-	if len(result.Choices) == 0 {
-		return "", usage, fmt.Errorf("openrouter: no choices in response")
-	}
-	// Check truncation before empty-text: a length-truncated response may
-	// have empty content (e.g. budget consumed by reasoning), but the call
-	// was still billed — return usage so cost is recorded.
-	if result.Choices[0].FinishReason == "length" {
-		return "", usage, fmt.Errorf("openrouter: response truncated at max_tokens; raise max_tokens to avoid truncation")
-	}
-	// Handle unfinished tool calls: the model returned tool_calls without a
-	// final text answer. This may indicate the server-tool budget was exhausted
-	// or the model is requesting a client-side tool loop (not supported here).
-	if result.Choices[0].FinishReason == "tool_calls" {
-		return "", usage, fmt.Errorf("openrouter: response ended with tool_calls (no final text answer; consider raising server_tool_max_calls if using server tools)")
-	}
-	text := strings.TrimSpace(result.Choices[0].Message.Content)
-	if text == "" {
-		return "", usage, fmt.Errorf("openrouter: empty response content")
-	}
-
-	return text, usage, nil
+	return orChat(ctx, req, apiKey, "openrouter", ccfg)
 }
 
 // callFusion sends a single OpenRouter Fusion request. analysisModels are sent
 // as "analysis_models" in the plugin block; OpenRouter runs them in parallel
 // and the judge synthesizes their responses. Returns the judge's analysis text.
 func callFusion(ctx context.Context, analysisModels []string, apiKey, question, briefing string, ccfg PanelCallConfig) (string, OracleUsage, error) {
-	endpoint := openRouterEndpoint
-	if ccfg.OpenRouterEndpoint != "" {
-		endpoint = ccfg.OpenRouterEndpoint
-	}
-
 	ctxLen := ResolveContextLength(ctx, "openrouter/fusion")
 	fit := FitToContext(oracleSystemPrompt, question, briefing, ccfg.MaxTokens, ctxLen)
 	if fit.CannotFit {
@@ -892,7 +824,7 @@ func callFusion(ctx context.Context, analysisModels []string, apiKey, question, 
 		plugin.MaxToolCalls = ccfg.FusionMaxToolCalls
 	}
 
-	body, err := json.Marshal(orReq{
+	req := orReq{
 		Model:     "openrouter/fusion",
 		MaxTokens: fit.MaxTokens,
 		Messages: []orMsg{
@@ -900,7 +832,22 @@ func callFusion(ctx context.Context, analysisModels []string, apiKey, question, 
 			{Role: "user", Content: userContent},
 		},
 		Plugins: []orFusionPlugin{plugin},
-	})
+	}
+	return orChat(ctx, req, apiKey, "openrouter/fusion", ccfg)
+}
+
+// orChat is the shared OpenRouter HTTP + response-parsing helper used by both
+// callOpenRouter and callFusion. It handles: timeout setup, HTTP POST, error
+// parsing (non-200, 200-with-error-body), response decoding, usage extraction
+// (preserved on all error paths), truncation check, tool_calls check, and
+// empty-content check. The label is used in error messages for identification.
+func orChat(ctx context.Context, req orReq, apiKey, label string, ccfg PanelCallConfig) (string, OracleUsage, error) {
+	endpoint := openRouterEndpoint
+	if ccfg.OpenRouterEndpoint != "" {
+		endpoint = ccfg.OpenRouterEndpoint
+	}
+
+	body, err := json.Marshal(req)
 	if err != nil {
 		return "", OracleUsage{}, fmt.Errorf("marshal: %w", err)
 	}
@@ -918,41 +865,57 @@ func callFusion(ctx context.Context, analysisModels []string, apiKey, question, 
 	if err != nil {
 		return "", OracleUsage{}, err
 	}
+
 	if status != http.StatusOK {
 		var apiErr orResp
 		if json.Unmarshal(raw, &apiErr) == nil && apiErr.Error != nil {
-			return "", OracleUsage{}, fmt.Errorf("fusion: HTTP %d: %s", status, apiErr.Error.Message)
+			return "", OracleUsage{}, fmt.Errorf("%s: HTTP %d: %s", label, status, apiErr.Error.Message)
 		}
-		return "", OracleUsage{}, fmt.Errorf("fusion: HTTP %d", status)
+		return "", OracleUsage{}, fmt.Errorf("%s: HTTP %d", label, status)
 	}
 
 	var result orResp
 	if err := json.Unmarshal(raw, &result); err != nil {
 		return "", OracleUsage{}, fmt.Errorf("parse response: %w", err)
 	}
-	if len(result.Choices) == 0 {
-		return "", OracleUsage{}, fmt.Errorf("openrouter/fusion: no choices in response")
-	}
-	// Check truncation before empty-text: a length-truncated response may
-	// have empty content, but the call was still billed.
-	if result.Choices[0].FinishReason == "length" {
-		truncUsage := OracleUsage{}
-		if result.Usage != nil {
-			truncUsage.InputTokens = int64(result.Usage.PromptTokens)
-			truncUsage.OutputTokens = int64(result.Usage.CompletionTokens)
-		}
-		return "", truncUsage, fmt.Errorf("openrouter/fusion: response truncated at max_tokens; raise max_tokens to avoid truncation")
-	}
-	text := strings.TrimSpace(result.Choices[0].Message.Content)
-	if text == "" {
-		return "", OracleUsage{}, fmt.Errorf("openrouter/fusion: empty response")
-	}
 
+	// Extract usage immediately after successful decode — preserve it on all
+	// subsequent error paths so billed calls are accounted for.
 	var usage OracleUsage
 	if result.Usage != nil {
 		usage.InputTokens = int64(result.Usage.PromptTokens)
 		usage.OutputTokens = int64(result.Usage.CompletionTokens)
+		if result.Usage.ServerToolUse != nil {
+			usage.WebSearchRequests = int64(result.Usage.ServerToolUse.WebSearchRequests)
+		}
 	}
+
+	// Check for error object in 200 response (provider failures can return
+	// HTTP 200 with an error body).
+	if result.Error != nil {
+		return "", usage, fmt.Errorf("%s: %s", label, result.Error.Message)
+	}
+
+	if len(result.Choices) == 0 {
+		return "", usage, fmt.Errorf("%s: no choices in response", label)
+	}
+	// Check truncation before empty-text: a length-truncated response may
+	// have empty content (e.g. budget consumed by reasoning), but the call
+	// was still billed — return usage so cost is recorded.
+	if result.Choices[0].FinishReason == "length" {
+		return "", usage, fmt.Errorf("%s: response truncated at max_tokens; raise max_tokens to avoid truncation", label)
+	}
+	// Handle unfinished tool calls: the model returned tool_calls without a
+	// final text answer. This may indicate the tool budget was exhausted
+	// or the model is requesting a client-side tool loop (not supported here).
+	if result.Choices[0].FinishReason == "tool_calls" {
+		return "", usage, fmt.Errorf("%s: response ended with tool_calls (no final text answer)", label)
+	}
+	text := strings.TrimSpace(result.Choices[0].Message.Content)
+	if text == "" {
+		return "", usage, fmt.Errorf("%s: empty response content", label)
+	}
+
 	return text, usage, nil
 }
 

@@ -1482,3 +1482,47 @@ func TestAutoCounselSkipGateClearedOnError(t *testing.T) {
 		t.Error("autoCounselSkipGate was not cleared on early error return — flag leaked")
 	}
 }
+
+// ── Card #M5: mashuraCap tests ─────────────────────────────────────────────
+
+// TestMashuraCapNoSources verifies that a briefing without a Sources section
+// is simply tail-truncated.
+func TestMashuraCapNoSources(t *testing.T) {
+	// Create a string larger than the cap with no "## Sources" marker.
+	s := strings.Repeat("A", mashuraToolBriefingCap+500)
+	result := mashuraCap(s)
+	if len(result) > mashuraToolBriefingCap+50 { // allow for truncation notice
+		t.Errorf("result length %d exceeds cap + notice", len(result))
+	}
+	if !strings.Contains(result, "[briefing truncated") {
+		t.Error("expected truncation notice")
+	}
+}
+
+// TestMashuraCapPreservesSources verifies that the Sources section is preserved
+// when the briefing is truncated, using the actual header format
+// "## Sources (read by Wakil)\n".
+func TestMashuraCapPreservesSources(t *testing.T) {
+	// Build a briefing where body is large and sources are small.
+	body := strings.Repeat("B", mashuraToolBriefingCap-200)
+	sources := "## Sources (read by Wakil)\n\nfile.go: line 42\n"
+	s := body + sources
+
+	result := mashuraCap(s)
+	if !strings.Contains(result, "## Sources") {
+		t.Error("Sources section was dropped by mashuraCap")
+	}
+	if !strings.Contains(result, "file.go: line 42") {
+		t.Error("source evidence was dropped by mashuraCap")
+	}
+}
+
+// TestMashuraCapUnderLimitNoChange verifies that a briefing under the cap
+// is returned unchanged.
+func TestMashuraCapUnderLimitNoChange(t *testing.T) {
+	s := "short briefing\n## Sources (read by Wakil)\n\nfile.go\n"
+	result := mashuraCap(s)
+	if result != s {
+		t.Errorf("briefing under cap was modified: got %q", result)
+	}
+}
