@@ -173,6 +173,11 @@ func (a *App) handleMashura(ctx context.Context, name string, tc proxy.ToolCall)
 // fallback, subagents); sync=false enqueues the panel on the async registry
 // and returns a placeholder pointing at the op id.
 func (a *App) runMashuraCore(ctx context.Context, name string, tc proxy.ToolCall, sync bool) string {
+	// Consume the auto-counsel skip-gate flag at the very top so it can't leak
+	// on early error returns (resolvePanel/key errors).
+	skipGate := a.autoCounselSkipGate
+	a.autoCounselSkipGate = false
+
 	// Extract the optional per-call panel override before tool-specific parsing.
 	panelOverride := mashuraPanelArg(tc)
 
@@ -194,18 +199,15 @@ func (a *App) runMashuraCore(ctx context.Context, name string, tc proxy.ToolCall
 	}
 
 	// Resolve the panel config (fail-closed: key check before gate).
-	panelName, panel := a.resolvePanel(name, panelOverride)
+	panelName, panel, panelOK := a.resolvePanel(name, panelOverride)
+	if !panelOK {
+		return "ERROR: panel " + panelName + " not found or has no models"
+	}
 	apiKeys, keyErr := a.mashuraPanelKeys(panel)
 	if keyErr != nil {
 		return "ERROR: " + keyErr.Error()
 	}
 
-	// Single gate for the whole panel. In /auto mode the confirm auto-approves
-	// with a visible ⚡ auto note (tuiConfirmer); autoCounselSkipGate bypasses
-	// the gate entirely for auto-counsel fires. Consume the flag immediately
-	// so it can't leak.
-	skipGate := a.autoCounselSkipGate
-	a.autoCounselSkipGate = false
 	maxTokens := a.mashuraMaxTokensFor(name)
 	detail := counsel.PanelDetail(panelName, panel.Models, panel.Mode, question, briefing)
 	if !skipGate && !a.Confirm(name, "Send to external AI?", detail, false) {
@@ -379,9 +381,19 @@ func mashuraPanelArg(tc proxy.ToolCall) string {
 
 // resolvePanel returns the panel name and config to use for a mashura tool call.
 // Resolution order: explicit override → tool mapping in MashuraToolPanels → "default"
-// panel → built-in single-Anthropic-model fallback using OracleModel.
-func (a *App) resolvePanel(toolName, override string) (string, config.MashuraPanelConfig) {
-	name := override
+// panel → built-in single-model fallback using OracleModel/MashuraFallbackModel.
+//
+// An explicit override that names a nonexistent panel is an error (returns
+// ok=false) — a typo in the panel argument should not silently fall back to a
+// different panel. A missing tool-mapping target is also an error.
+//
+// The built-in fallback is provider-aware: it uses MashuraFallbackModel if set
+// (must be explicitly prefixed, e.g. "openrouter:anthropic/claude-sonnet-4"),
+// otherwise auto-detects based on which API key env var is set. This fixes the
+// bug where OpenRouter-only users saw tools advertised but every call failed
+// because the fallback hardcoded "anthropic:" + OracleModel.
+func (a *App) resolvePanel(toolName, override string) (name string, panel config.MashuraPanelConfig, ok bool) {
+	name = override
 	if name == "" {
 		short := strings.TrimPrefix(toolName, "mashura__")
 		if toolName == "oracle__ask" {
@@ -391,27 +403,82 @@ func (a *App) resolvePanel(toolName, override string) (string, config.MashuraPan
 			name = a.Cfg.MashuraToolPanels[short]
 		}
 	}
+	// If an explicit name was provided (override or tool mapping), it must
+	// resolve to a configured panel — UNLESS the name is "default", which
+	// is eligible for the built-in fallback if no configured "default" panel
+	// exists (so /mashura map review default works even without a configured
+	// default panel). A typo like panel="resilient" still fails closed.
+	if name != "" && name != "default" {
+		if a.Cfg.MashuraPanels != nil {
+			if p, exists := a.Cfg.MashuraPanels[name]; exists && len(p.Models) > 0 {
+				if p.Mode == "" {
+					p.Mode = "panel"
+				}
+				return name, p, true
+			}
+		}
+		// Named panel not found or empty — fail-closed.
+		return name, config.MashuraPanelConfig{}, false
+	}
+	// No override, no tool mapping, or name=="default" → try the "default" panel.
 	if name == "" {
 		name = "default"
 	}
 	if a.Cfg.MashuraPanels != nil {
-		if p, ok := a.Cfg.MashuraPanels[name]; ok && len(p.Models) > 0 {
+		if p, exists := a.Cfg.MashuraPanels[name]; exists && len(p.Models) > 0 {
 			if p.Mode == "" {
 				p.Mode = "panel"
 			}
-			return name, p
+			return name, p, true
 		}
 	}
-	// Built-in fallback: single Anthropic model from the legacy OracleModel field.
+	// Built-in fallback: provider-aware.
+	model := a.fallbackModel()
 	return name, config.MashuraPanelConfig{
-		Models: []string{"anthropic:" + a.Cfg.OracleModel},
+		Models: []string{model},
 		Mode:   "panel",
-	}
+	}, true
 }
+
+// fallbackModel returns the prefixed model string for the built-in fallback
+// panel when no "default" panel is configured. Resolution:
+//  1. MashuraFallbackModel (config) if set — must be explicitly prefixed.
+//  2. OracleModel if it already contains a provider prefix (colon).
+//  3. Auto-detect: if only the OpenRouter key is set, use "openrouter:" + the
+//     OpenRouter default model constant. If only the Anthropic key is set, use
+//     "anthropic:" + OracleModel. If both, prefer "anthropic:" + OracleModel
+//     (backward compat). If neither, use "anthropic:" + OracleModel (the key
+//     check in mashuraPanelKeys will catch the missing key and fail-closed).
+func (a *App) fallbackModel() string {
+	if fm := a.Cfg.MashuraFallbackModel; fm != "" {
+		return fm
+	}
+	// If OracleModel already has a provider prefix (e.g. "openrouter:anthropic/..."),
+	// use it as-is to avoid double-prefixing. We check for known prefixes rather
+	// than any colon, because OpenRouter model IDs can contain colons in variant
+	// suffixes (e.g. "anthropic/claude-sonnet-4:free").
+	if strings.HasPrefix(a.Cfg.OracleModel, "anthropic:") || strings.HasPrefix(a.Cfg.OracleModel, "openrouter:") {
+		return a.Cfg.OracleModel
+	}
+	// Auto-detect based on available keys.
+	hasAnthropic := os.Getenv(a.Cfg.OracleAPIKeyEnv) != ""
+	hasOpenRouter := os.Getenv(a.Cfg.OpenRouterAPIKeyEnv) != ""
+	if !hasAnthropic && hasOpenRouter {
+		// OpenRouter-only: use the OpenRouter default model.
+		return "openrouter:" + defaultOpenRouterModel
+	}
+	// Anthropic key present (or neither) → backward-compatible Anthropic fallback.
+	return "anthropic:" + a.Cfg.OracleModel
+}
+
+// defaultOpenRouterModel is the model used when auto-detecting an OpenRouter-only
+// fallback and no explicit model is configured. It must be a valid OpenRouter
+// model ID (vendor/model format).
+const defaultOpenRouterModel = "anthropic/claude-sonnet-4"
 
 // defaultPanel returns the "default" panel config, used by workflow-phase oracle
 // calls that are not model-initiated mashura tool calls.
-func (a *App) defaultPanel() (string, config.MashuraPanelConfig) {
+func (a *App) defaultPanel() (string, config.MashuraPanelConfig, bool) {
 	return a.resolvePanel("", "")
 }
 
@@ -992,12 +1059,21 @@ func DetectStruggle(traces []ToolTraceEntry) (symptom string, detected bool) {
 }
 
 // mashuraAvailable reports whether mashura counsel tools are available
-// (oracle enabled AND at least one API key is set). WP-7.10d: single predicate.
+// (oracle enabled AND the resolved default panel's API keys are present).
+// WP-7.10d: single predicate.
 func (a *App) mashuraAvailable() bool {
 	if !a.Cfg.OracleEnabled {
 		return false
 	}
-	return os.Getenv(a.Cfg.OracleAPIKeyEnv) != "" || os.Getenv(a.Cfg.OpenRouterAPIKeyEnv) != ""
+	// Check that the resolved default panel's keys are actually present.
+	// This fixes the bug where tools were advertised when ANY key was set,
+	// but the fallback always required the Anthropic key.
+	_, panel, ok := a.resolvePanel("", "")
+	if !ok {
+		return false
+	}
+	_, err := a.mashuraPanelKeys(panel)
+	return err == nil
 }
 
 // maybeSuggestDebug offers mashura__debug when the rolling trace shows a struggle

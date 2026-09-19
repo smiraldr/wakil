@@ -69,6 +69,8 @@
   "oracle_api_key_env": "ANTHROPIC_API_KEY",
   "openrouter_api_key_env": "OPENROUTER_API_KEY",
 
+  "mashura_fallback_model": "",
+
   "mashura_panels": {
     "default": {
       "models": ["anthropic:claude-sonnet-4-6"],

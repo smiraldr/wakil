@@ -298,6 +298,13 @@ type Config struct {
 	// through OpenRouter (provider prefix "openrouter:") and by Fusion mode.
 	OpenRouterAPIKeyEnv string `json:"openrouter_api_key_env,omitempty"` // env var that holds the OpenRouter API key
 
+	// MashuraFallbackModel is an explicitly prefixed model string (e.g.
+	// "openrouter:anthropic/claude-sonnet-4" or "anthropic:claude-sonnet-4-6")
+	// used as the built-in fallback when no "default" panel is configured.
+	// If empty, the fallback auto-detects based on which API key is set.
+	// Unlike OracleModel, this field MUST include the provider prefix.
+	MashuraFallbackModel string `json:"mashura_fallback_model,omitempty"` // explicitly prefixed fallback model
+
 	// Canonical mashura_* aliases. Empty/zero means "unset, fall back to oracle_*".
 	// Merged into the Oracle* fields in LoadConfig so the rest of the code reads
 	// one set of fields.
@@ -748,24 +755,24 @@ func DefaultConfig() Config {
 		HardMaxFrac:             0.95,   // hard ceiling at 95% of effective context
 		ContextCapacityFrac:     0.80,   // use 80% of proxy's usable_ctx as the working budget
 
-		ReasoningBudgetTokens:  4096,      // headroom for extended thinking
-		AnswerMarginTokens:     4096,      // headroom for the final answer
-		ContextTokensFallback:  131072,    // assumed n_ctx when the backend is unreachable
-		ToolResultCap:          8000,      // keep first 8k chars in ctx; spill the rest to disk
-		ToolResultTTL:          3,         // evict after 3 completed turns (longer window before re-reads are needed)
-		ReadFileSizeLimit:      1 << 20,   // 1 MB: refuse larger reads at the tool layer
-		MaxFullReadBytes:       256 << 10, // 256 KB: full-read ceiling (higher than ToolResultCap 8K, under MaxRequestBytes 8MB)
-		MaxRequestBytes:        8 << 20,   // 8 MB: trim tool results before sending if over
-		BackendMaxRetries:      3,
-		MaxParallelSubagents:   2,
-		SubagentTimeoutSeconds: 360, // must match agent.defaultSubagentTimeoutSeconds (raised from 180s: 40 iterations × ~6s + wrap-up + retry margin)
+		ReasoningBudgetTokens:      4096,      // headroom for extended thinking
+		AnswerMarginTokens:         4096,      // headroom for the final answer
+		ContextTokensFallback:      131072,    // assumed n_ctx when the backend is unreachable
+		ToolResultCap:              8000,      // keep first 8k chars in ctx; spill the rest to disk
+		ToolResultTTL:              3,         // evict after 3 completed turns (longer window before re-reads are needed)
+		ReadFileSizeLimit:          1 << 20,   // 1 MB: refuse larger reads at the tool layer
+		MaxFullReadBytes:           256 << 10, // 256 KB: full-read ceiling (higher than ToolResultCap 8K, under MaxRequestBytes 8MB)
+		MaxRequestBytes:            8 << 20,   // 8 MB: trim tool results before sending if over
+		BackendMaxRetries:          3,
+		MaxParallelSubagents:       2,
+		SubagentTimeoutSeconds:     360, // must match agent.defaultSubagentTimeoutSeconds (raised from 180s: 40 iterations × ~6s + wrap-up + retry margin)
 		SubagentSyncTimeoutSeconds: 600, // generous for edit tasks; bounds edit/tools children that previously had no per-child timeout
-		OracleModel:            "claude-sonnet-4-6",
-		OracleMaxTokens:        4096,
-		OracleAPIKeyEnv:        "ANTHROPIC_API_KEY",
-		OpenRouterAPIKeyEnv:    "OPENROUTER_API_KEY",
-		OracleTimeoutSeconds:   300,
-		WFFinalReview:          true,
+		OracleModel:                "claude-sonnet-4-6",
+		OracleMaxTokens:            4096,
+		OracleAPIKeyEnv:            "ANTHROPIC_API_KEY",
+		OpenRouterAPIKeyEnv:        "OPENROUTER_API_KEY",
+		OracleTimeoutSeconds:       300,
+		WFFinalReview:              true,
 	}
 }
 
@@ -875,6 +882,19 @@ func LoadConfig(argv []string) (Config, error) {
 	}
 	if cfg.MashuraMode != "" {
 		cfg.WFOracleMode = cfg.MashuraMode
+	}
+
+	// Validate MashuraFallbackModel: if set, it must have a supported provider
+	// prefix. This catches misconfiguration at load time rather than at call
+	// time (where the error is a confusing "unknown provider").
+	if cfg.MashuraFallbackModel != "" {
+		if !strings.HasPrefix(cfg.MashuraFallbackModel, "anthropic:") &&
+			!strings.HasPrefix(cfg.MashuraFallbackModel, "openrouter:") {
+			return cfg, fmt.Errorf(
+				"mashura_fallback_model %q must include a provider prefix "+
+					"(e.g. \"openrouter:anthropic/claude-sonnet-4\" or \"anthropic:claude-sonnet-4-6\")",
+				cfg.MashuraFallbackModel)
+		}
 	}
 
 	// 2) environment

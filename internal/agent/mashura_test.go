@@ -1103,3 +1103,382 @@ func TestAutoCounselInjectsIntoConv(t *testing.T) {
 		t.Errorf("injected tool result malformed: role=%q id=%q (want %q)", toolMsg.Role, toolMsg.ToolCallID, assistMsg.ToolCalls[0].ID)
 	}
 }
+
+// ── Card #M1: provider-aware fallback tests ────────────────────────────────
+
+// TestResolvePanelOpenRouterOnlyFallback verifies that when only the OpenRouter
+// key is set (no Anthropic key, no configured panels), the built-in fallback
+// uses the OpenRouter provider — not Anthropic. This is the core M1 bug fix.
+func TestResolvePanelOpenRouterOnlyFallback(t *testing.T) {
+	t.Setenv("OPENROUTER_API_KEY", "test-or-key")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+
+	app := &App{
+		Cfg: config.Config{
+			OracleEnabled:       true,
+			OracleModel:         "claude-sonnet-4-6",
+			OracleAPIKeyEnv:     "ANTHROPIC_API_KEY",
+			OpenRouterAPIKeyEnv: "OPENROUTER_API_KEY",
+		},
+	}
+
+	name, panel, ok := app.resolvePanel("", "")
+	if !ok {
+		t.Fatal("expected ok=true for OpenRouter-only fallback")
+	}
+	if name != "default" {
+		t.Errorf("panel name = %q, want 'default'", name)
+	}
+	if len(panel.Models) != 1 {
+		t.Fatalf("expected 1 model, got %d", len(panel.Models))
+	}
+	prov, model := counsel.ParseModelPrefix(panel.Models[0])
+	if prov != "openrouter" {
+		t.Errorf("provider = %q, want 'openrouter'", prov)
+	}
+	if model != defaultOpenRouterModel {
+		t.Errorf("model = %q, want %q", model, defaultOpenRouterModel)
+	}
+}
+
+// TestResolvePanelAnthropicOnlyFallback verifies that when only the Anthropic
+// key is set, the fallback uses the Anthropic provider with OracleModel
+// (backward-compatible behavior).
+func TestResolvePanelAnthropicOnlyFallback(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
+	t.Setenv("OPENROUTER_API_KEY", "")
+
+	app := &App{
+		Cfg: config.Config{
+			OracleEnabled:       true,
+			OracleModel:         "claude-sonnet-4-6",
+			OracleAPIKeyEnv:     "ANTHROPIC_API_KEY",
+			OpenRouterAPIKeyEnv: "OPENROUTER_API_KEY",
+		},
+	}
+
+	_, panel, ok := app.resolvePanel("", "")
+	if !ok {
+		t.Fatal("expected ok=true for Anthropic-only fallback")
+	}
+	prov, model := counsel.ParseModelPrefix(panel.Models[0])
+	if prov != "anthropic" {
+		t.Errorf("provider = %q, want 'anthropic'", prov)
+	}
+	if model != "claude-sonnet-4-6" {
+		t.Errorf("model = %q, want 'claude-sonnet-4-6'", model)
+	}
+}
+
+// TestResolvePanelBothKeysPrefersAnthropic verifies that when both keys are set,
+// the fallback prefers Anthropic + OracleModel (backward compat).
+func TestResolvePanelBothKeysPrefersAnthropic(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "key1")
+	t.Setenv("OPENROUTER_API_KEY", "key2")
+
+	app := &App{
+		Cfg: config.Config{
+			OracleEnabled:       true,
+			OracleModel:         "claude-sonnet-4-6",
+			OracleAPIKeyEnv:     "ANTHROPIC_API_KEY",
+			OpenRouterAPIKeyEnv: "OPENROUTER_API_KEY",
+		},
+	}
+
+	_, panel, ok := app.resolvePanel("", "")
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	prov, _ := counsel.ParseModelPrefix(panel.Models[0])
+	if prov != "anthropic" {
+		t.Errorf("provider = %q, want 'anthropic' (both keys → prefer anthropic)", prov)
+	}
+}
+
+// TestResolvePanelExplicitFallbackModel verifies that MashuraFallbackModel
+// overrides auto-detection when set.
+func TestResolvePanelExplicitFallbackModel(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "key1")
+	t.Setenv("OPENROUTER_API_KEY", "key2")
+
+	app := &App{
+		Cfg: config.Config{
+			OracleEnabled:        true,
+			OracleModel:          "claude-sonnet-4-6",
+			OracleAPIKeyEnv:      "ANTHROPIC_API_KEY",
+			OpenRouterAPIKeyEnv:  "OPENROUTER_API_KEY",
+			MashuraFallbackModel: "openrouter:google/gemini-2.5-pro",
+		},
+	}
+
+	_, panel, ok := app.resolvePanel("", "")
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	prov, model := counsel.ParseModelPrefix(panel.Models[0])
+	if prov != "openrouter" {
+		t.Errorf("provider = %q, want 'openrouter' (MashuraFallbackModel override)", prov)
+	}
+	if model != "google/gemini-2.5-pro" {
+		t.Errorf("model = %q, want 'google/gemini-2.5-pro'", model)
+	}
+}
+
+// TestResolvePanelOracleModelAlreadyPrefixed verifies that if OracleModel
+// already contains a provider prefix, it is not double-prefixed.
+func TestResolvePanelOracleModelAlreadyPrefixed(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "key1")
+	t.Setenv("OPENROUTER_API_KEY", "")
+
+	app := &App{
+		Cfg: config.Config{
+			OracleEnabled:       true,
+			OracleModel:         "openrouter:anthropic/claude-sonnet-4",
+			OracleAPIKeyEnv:     "ANTHROPIC_API_KEY",
+			OpenRouterAPIKeyEnv: "OPENROUTER_API_KEY",
+		},
+	}
+
+	_, panel, ok := app.resolvePanel("", "")
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	// Should use OracleModel as-is, not double-prefix to "anthropic:openrouter:..."
+	prov, _ := counsel.ParseModelPrefix(panel.Models[0])
+	if prov != "openrouter" {
+		t.Errorf("provider = %q, want 'openrouter' (already-prefixed OracleModel)", prov)
+	}
+}
+
+// TestResolvePanelOracleModelWithVariantSuffix verifies that a colon in an
+// OpenRouter variant suffix (e.g. ":free", ":beta") is NOT mistaken for a
+// provider prefix. This catches the fragile colon-detection bug Fable flagged.
+func TestResolvePanelOracleModelWithVariantSuffix(t *testing.T) {
+	t.Setenv("OPENROUTER_API_KEY", "or-key")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+
+	app := &App{
+		Cfg: config.Config{
+			OracleEnabled:       true,
+			OracleModel:         "anthropic/claude-sonnet-4:free", // OpenRouter slug with variant
+			OracleAPIKeyEnv:     "ANTHROPIC_API_KEY",
+			OpenRouterAPIKeyEnv: "OPENROUTER_API_KEY",
+		},
+	}
+
+	_, panel, ok := app.resolvePanel("", "")
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	// Should NOT treat this as already-prefixed. Since only the OpenRouter key
+	// is set, the fallback should use "openrouter:" + defaultOpenRouterModel,
+	// not pass "anthropic/claude-sonnet-4:free" through as-is (which would
+	// parse as provider "anthropic/claude-sonnet-4" → unknown provider).
+	prov, _ := counsel.ParseModelPrefix(panel.Models[0])
+	if prov != "openrouter" {
+		t.Errorf("provider = %q, want 'openrouter' (variant suffix should not be mistaken for prefix)", prov)
+	}
+}
+
+// TestResolvePanelToolMappingToDefault verifies that a tool mapping pointing
+// to "default" falls through to the built-in fallback when no configured
+// "default" panel exists (regression test for Fable's finding).
+func TestResolvePanelToolMappingToDefault(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "key")
+
+	app := &App{
+		Cfg: config.Config{
+			OracleEnabled:     true,
+			OracleAPIKeyEnv:   "ANTHROPIC_API_KEY",
+			OracleModel:       "claude-sonnet-4-6",
+			MashuraToolPanels: map[string]string{"review": "default"},
+		},
+	}
+
+	name, panel, ok := app.resolvePanel("mashura__review", "")
+	if !ok {
+		t.Error("expected ok=true for tool mapping to 'default' with no configured default panel")
+	}
+	if name != "default" {
+		t.Errorf("name = %q, want 'default'", name)
+	}
+	if len(panel.Models) != 1 {
+		t.Fatalf("expected 1 fallback model, got %d", len(panel.Models))
+	}
+}
+
+// TestResolvePanelUnknownOverrideErrors verifies that an explicit panel
+// override that names a nonexistent panel returns ok=false (fail-closed)
+// rather than silently falling back.
+func TestResolvePanelUnknownOverrideErrors(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "key")
+
+	app := &App{
+		Cfg: config.Config{
+			OracleEnabled:   true,
+			OracleAPIKeyEnv: "ANTHROPIC_API_KEY",
+		},
+	}
+
+	name, _, ok := app.resolvePanel("mashura__review", "resilient")
+	if ok {
+		t.Error("expected ok=false for unknown panel override 'resilient'")
+	}
+	if name != "resilient" {
+		t.Errorf("name = %q, want 'resilient'", name)
+	}
+}
+
+// TestResolvePanelMissingToolMappingTargetErrors verifies that a tool mapping
+// pointing to a nonexistent panel returns ok=false.
+func TestResolvePanelMissingToolMappingTargetErrors(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "key")
+
+	app := &App{
+		Cfg: config.Config{
+			OracleEnabled:     true,
+			OracleAPIKeyEnv:   "ANTHROPIC_API_KEY",
+			MashuraToolPanels: map[string]string{"review": "nonexistent"},
+		},
+	}
+
+	_, _, ok := app.resolvePanel("mashura__review", "")
+	if ok {
+		t.Error("expected ok=false for tool mapping to nonexistent panel")
+	}
+}
+
+// TestResolvePanelConfiguredDefaultTakesPrecedence verifies that a configured
+// "default" panel is used instead of the built-in fallback.
+func TestResolvePanelConfiguredDefaultTakesPrecedence(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "key")
+
+	app := &App{
+		Cfg: config.Config{
+			OracleEnabled:   true,
+			OracleAPIKeyEnv: "ANTHROPIC_API_KEY",
+			MashuraPanels: map[string]config.MashuraPanelConfig{
+				"default": {
+					Models: []string{"openrouter:google/gemini-2.5-pro", "anthropic:claude-opus-4-8"},
+					Mode:   "panel",
+				},
+			},
+		},
+	}
+
+	name, panel, ok := app.resolvePanel("", "")
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if name != "default" {
+		t.Errorf("name = %q, want 'default'", name)
+	}
+	if len(panel.Models) != 2 {
+		t.Fatalf("expected 2 models, got %d", len(panel.Models))
+	}
+}
+
+// TestMashuraAvailableOpenRouterOnly verifies that mashuraAvailable returns
+// true when only the OpenRouter key is set (the core bug: previously returned
+// true but calls failed).
+func TestMashuraAvailableOpenRouterOnly(t *testing.T) {
+	t.Setenv("OPENROUTER_API_KEY", "test-or-key")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+
+	app := &App{
+		Cfg: config.Config{
+			OracleEnabled:       true,
+			OracleModel:         "claude-sonnet-4-6",
+			OracleAPIKeyEnv:     "ANTHROPIC_API_KEY",
+			OpenRouterAPIKeyEnv: "OPENROUTER_API_KEY",
+		},
+	}
+
+	if !app.mashuraAvailable() {
+		t.Error("mashuraAvailable() = false, want true (OpenRouter-only should be available)")
+	}
+
+	// And the keys should actually resolve for the panel.
+	_, panel, ok := app.resolvePanel("", "")
+	if !ok {
+		t.Fatal("resolvePanel returned ok=false")
+	}
+	_, err := app.mashuraPanelKeys(panel)
+	if err != nil {
+		t.Errorf("mashuraPanelKeys failed for OpenRouter-only: %v", err)
+	}
+}
+
+// TestMashuraAvailableNeitherKey verifies that mashuraAvailable returns false
+// when no keys are set.
+func TestMashuraAvailableNeitherKey(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("OPENROUTER_API_KEY", "")
+
+	app := &App{
+		Cfg: config.Config{
+			OracleEnabled:       true,
+			OracleModel:         "claude-sonnet-4-6",
+			OracleAPIKeyEnv:     "ANTHROPIC_API_KEY",
+			OpenRouterAPIKeyEnv: "OPENROUTER_API_KEY",
+		},
+	}
+
+	if app.mashuraAvailable() {
+		t.Error("mashuraAvailable() = true, want false (no keys set)")
+	}
+}
+
+// TestMashuraAvailableDisabled verifies that oracle_enabled=false hides tools
+// even when keys are present.
+func TestMashuraAvailableDisabled(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "key")
+	t.Setenv("OPENROUTER_API_KEY", "key")
+
+	app := &App{
+		Cfg: config.Config{
+			OracleEnabled:       false,
+			OracleAPIKeyEnv:     "ANTHROPIC_API_KEY",
+			OpenRouterAPIKeyEnv: "OPENROUTER_API_KEY",
+		},
+	}
+
+	if app.mashuraAvailable() {
+		t.Error("mashuraAvailable() = true, want false (oracle_enabled=false)")
+	}
+}
+
+// TestAutoCounselSkipGateClearedOnError verifies that autoCounselSkipGate is
+// consumed (set to false) even when runMashuraCore returns early due to a
+// resolvePanel or key error. This is the leak fix flagged by Mashūra.
+func TestAutoCounselSkipGateClearedOnError(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("OPENROUTER_API_KEY", "")
+
+	app := &App{
+		Cfg: config.Config{
+			OracleEnabled:   true,
+			OracleAPIKeyEnv: "ANTHROPIC_API_KEY",
+			OracleModel:     "test-model",
+		},
+		Client: &proxy.Client{},
+		Out:    io.Discard,
+		Confirm: func(_, _, _ string, _ bool) bool {
+			return true
+		},
+	}
+	app.autoCounselSkipGate = true
+
+	// This will fail at mashuraPanelKeys (no key) — an early error return.
+	result := app.runMashuraCore(context.Background(), "mashura__review",
+		proxy.ToolCall{Function: proxy.FunctionCall{Name: "mashura__review", Arguments: `{}`}},
+		true, // sync
+	)
+
+	if !strings.HasPrefix(result, "ERROR:") {
+		t.Errorf("expected ERROR result, got: %q", result)
+	}
+	if app.autoCounselSkipGate {
+		t.Error("autoCounselSkipGate was not cleared on early error return — flag leaked")
+	}
+}

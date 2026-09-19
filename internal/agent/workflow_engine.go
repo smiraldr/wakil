@@ -259,7 +259,10 @@ func doWFOracle(ctx context.Context, app *App, question string) (string, bool) {
 	if reason := workflow.ValidateBriefing(briefing, false); reason != "" {
 		return "briefing incomplete: " + reason, false
 	}
-	panelName, panel := app.defaultPanel()
+	panelName, panel, panelOK := app.defaultPanel()
+	if !panelOK {
+		return "oracle unavailable: default panel not configured", false
+	}
 	result, _, ok := runWFPanel(ctx, app, "Workflow mashūra check?", question, briefing, panelName, panel)
 	return result, ok
 }
@@ -361,7 +364,13 @@ func HandleFinalReview(ctx context.Context, app *App) {
 		wfProgNote(app, "· type /plan approve to force-close, or fix oracle config and retry")
 		return
 	}
-	panelName, panel := app.defaultPanel()
+	panelName, panel, panelOK := app.defaultPanel()
+	if !panelOK {
+		wfProgNote(app, "⚠ FINAL REVIEW: oracle unavailable — default panel not configured")
+		wfWriteFinalLog(app, "FINAL REVIEW skipped: default panel not configured — /plan approve required to close.")
+		wfProgNote(app, "· type /plan approve to force-close, or fix oracle config and retry")
+		return
+	}
 	oracleResult, panelResults, oracleAvail := doWFOracleWithBriefing(ctx, app, reviewQ, briefing, panelName, panel)
 	if !oracleAvail {
 		wfProgNote(app, "⚠ FINAL REVIEW: oracle unavailable — "+oracleResult)

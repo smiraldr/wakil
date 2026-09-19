@@ -932,3 +932,47 @@ func TestOutputMode_InvalidEnvRejected(t *testing.T) {
 		t.Fatalf("expected output_mode error for invalid env, got: %v", err)
 	}
 }
+
+// TestLoadConfig_MashuraFallbackModelUnprefixed verifies that LoadConfig
+// rejects a MashuraFallbackModel without a provider prefix.
+func TestLoadConfig_MashuraFallbackModelUnprefixed(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	cfgContent := `{
+		"base_url": "http://proxy:11400",
+		"oracle_enabled": true,
+		"mashura_fallback_model": "claude-sonnet-4-6"
+	}`
+	if err := os.WriteFile(cfgPath, []byte(cfgContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadConfig([]string{"--config", cfgPath, "--exec", "direct"})
+	if err == nil {
+		t.Fatal("expected error for unprefixed mashura_fallback_model, got nil")
+	}
+	if !strings.Contains(err.Error(), "mashura_fallback_model") {
+		t.Fatalf("expected mashura_fallback_model error, got: %v", err)
+	}
+}
+
+// TestLoadConfig_MashuraFallbackModelValid verifies that a properly prefixed
+// MashuraFallbackModel passes validation.
+func TestLoadConfig_MashuraFallbackModelValid(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	cfgContent := `{
+		"base_url": "http://proxy:11400",
+		"oracle_enabled": true,
+		"mashura_fallback_model": "openrouter:anthropic/claude-sonnet-4"
+	}`
+	if err := os.WriteFile(cfgPath, []byte(cfgContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig([]string{"--config", cfgPath, "--exec", "direct"})
+	if err != nil {
+		t.Fatalf("unexpected error for valid mashura_fallback_model: %v", err)
+	}
+	if cfg.MashuraFallbackModel != "openrouter:anthropic/claude-sonnet-4" {
+		t.Errorf("MashuraFallbackModel = %q, want 'openrouter:anthropic/claude-sonnet-4'", cfg.MashuraFallbackModel)
+	}
+}
