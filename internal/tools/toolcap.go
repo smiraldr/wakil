@@ -1,7 +1,10 @@
 package tools
 
 import (
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -135,18 +138,18 @@ func ToolCacheRoot() string {
 	return filepath.Join(base, "toolcache")
 }
 
-// IsToolCacheHostPath reports whether path resolves (after Clean) to a
-// location under the wakil toolcache root on THIS host. Used by read_file/
+// IsToolCacheHostPath reports whether path LEXICALLY resolves (after Clean) to
+// a location under the wakil toolcache root on THIS host. Used by read_file/
 // read_file_full to recognise a spill-cache pointer before attempting
 // Executor.ConfinePath, which would otherwise reject it unconditionally.
 //
-// Deliberately an EXACT-PREFIX check on the canonicalized toolcache root, not
+// Deliberately an EXACT-PREFIX check on the Clean'd toolcache root, not
 // a loose substring match — a path merely containing the word "toolcache"
 // elsewhere (e.g. inside a legitimate workspace file) must not be
 // misidentified as a cache artifact. path is Clean'd but not symlink-resolved:
-// spill files are created fresh by os.CreateTemp and never symlinked, so this
-// is not a confinement-escape surface — see the doc comment on
-// ReadHostCacheFile for the matching read-side guarantee.
+// this is a fast CLASSIFIER only. The confinement guarantee lives in
+// ReadHostCacheFile/StatHostCacheFile, which re-verify containment after
+// symlink resolution via os.Root before touching the file.
 func IsToolCacheHostPath(path string) bool {
 	root := ToolCacheRoot()
 	if root == "" || path == "" {
@@ -157,24 +160,138 @@ func IsToolCacheHostPath(path string) bool {
 	return p == root || strings.HasPrefix(p, root+string(filepath.Separator))
 }
 
-// ReadHostCacheFile reads a toolcache spill file directly from the host
-// filesystem, bypassing the sandboxed Executor entirely. Callers MUST verify
-// IsToolCacheHostPath(path) first — this function performs no confinement
-// check of its own; it trusts the caller's classification because the whole
-// point is to serve these paths WITHOUT an Executor/ConfinePath round-trip
-// (that round-trip is exactly what makes them unreachable in the first
-// place: Docker mode never mounts this directory into the container, and
-// Direct mode's workspace root is a different tree entirely).
+// ErrHostCacheEscape is returned (wrapped, match with errors.Is) when a path
+// resolves OUTSIDE the toolcache root — a traversal or symlink escape. It is
+// distinct from ordinary filesystem errors so callers can surface it as a
+// refusal rather than a transient failure.
+var ErrHostCacheEscape = errors.New("path resolves outside the toolcache root")
+
+// ErrHostCacheNotRegular is returned when a toolcache-rooted path resolves to
+// a directory or other non-regular file.
+var ErrHostCacheNotRegular = errors.New("not a regular file under the toolcache root")
+
+// resolveHostCachePath is the shared confinement primitive for the host-cache
+// read/stat functions. It opens the canonical (symlink-resolved) toolcache
+// root with os.Root and resolves rel — the caller's path minus the root
+// prefix — inside it. os.Root performs openat-style traversal: ANY component
+// (leaf or intermediate) that is a symlink escaping the root is rejected, and
+// the result cannot race into the root's parent tree. Returns the file info
+// of the resolved entry; callers reject non-regular files.
 //
-// This is safe as a design (not just as an implementation) because the only
-// paths that satisfy IsToolCacheHostPath are ones Wakil itself generated via
-// os.CreateTemp under ToolCacheRoot() moments earlier — the model can only
-// ever supply back a path it was FIRST handed by Wakil in a "... at: PATH"
-// marker; it cannot conjure an arbitrary toolcache-rooted path referring to
-// content it wasn't already given, because that path includes a random
-// CreateTemp-suffixed filename it cannot predict.
+// Threat model (documented per impl review): protection against STATIC
+// symlink escapes and traversal. Adversarial concurrent mutation of the
+// toolcache tree is out of scope — in direct mode obtaining a host write
+// already requires a user-confirmed shell command, at which point the
+// consent boundary has already been crossed by that command itself.
+func resolveHostCachePath(path string) (*os.Root, string, os.FileInfo, error) {
+	root := ToolCacheRoot()
+	if root == "" {
+		return nil, "", nil, ErrHostCacheEscape
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	// The root itself may sit behind symlinked ancestors (e.g. a symlinked
+	// XDG data dir) — canonicalize it, then require the LEXICAL path to have
+	// classified as inside before resolving (defense in depth; callers
+	// IsToolCacheHostPath first).
+	resolvedRoot, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	cleaned := filepath.Clean(path)
+	// rel is computed against whichever form matched: the Clean'd path if it
+	// lexically classifies inside, else the symlink-resolved path (alias via
+	// a symlinked ancestor). Each candidate is contained-checked against its
+	// MATCHING root form — lexical against the lexical abs root, canonical
+	// against resolvedRoot — so a canonical-form path under a symlinked root
+	// resolves correctly. NB: lexical Clean collapses root/sym/../file to
+	// root/file, which os.Root then serves; kernel resolution would follow
+	// sym first. Not an escape (the result stays inside), just lexical
+	// semantics — documented here.
+	relBase := abs
+	relPath := cleaned
+	if !IsToolCacheHostPath(cleaned) {
+		resolved, rerr := filepath.EvalSymlinks(cleaned)
+		if rerr != nil || !underRoot(resolved, resolvedRoot) {
+			return nil, "", nil, fmt.Errorf("%w: %s", ErrHostCacheEscape, path)
+		}
+		relBase = resolvedRoot
+		relPath = resolved
+	}
+	rel, err := filepath.Rel(relBase, relPath)
+	if err != nil || rel == ".." ||
+		strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return nil, "", nil, fmt.Errorf("%w: %s", ErrHostCacheEscape, path)
+	}
+	if rel == "." {
+		return nil, "", nil, fmt.Errorf("%w: %s", ErrHostCacheNotRegular, path)
+	}
+	r, err := os.OpenRoot(resolvedRoot)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	fi, err := r.Stat(rel)
+	if err != nil {
+		r.Close()
+		if isEscapeErr(err) {
+			return nil, "", nil, fmt.Errorf("%w: %s", ErrHostCacheEscape, path)
+		}
+		return nil, "", nil, err
+	}
+	return r, rel, fi, nil
+}
+
+// underRoot is the exact-prefix containment check against an already-Clean'd
+// root (same rule as IsToolCacheHostPath, parameterized).
+func underRoot(p, root string) bool {
+	return p == root || strings.HasPrefix(p, root+string(filepath.Separator))
+}
+
+// isEscapeErr reports whether err is os.Root's "path escapes from parent"
+// refusal. The sentinel is unexported in the standard library (verified in
+// GOROOT/src/os/file.go), so match the *fs.PathError's cause, not the message
+// text of the wrapper (which embeds the path and can name-collide).
+func isEscapeErr(err error) bool {
+	var pe *fs.PathError
+	if errors.As(err, &pe) {
+		// pe.Err is the CAUSE (no path embedded), so matching its message is
+		// safe from name collisions. os's sentinel is unexported, so identity
+		// comparison is impossible; if a future Go exports it, switch to
+		// errors.Is against the exported sentinel.
+		return pe.Err != nil && pe.Err.Error() == "path escapes from parent"
+	}
+	return false
+}
+
+// ReadHostCacheFile reads a toolcache spill file directly from the host
+// filesystem, bypassing the sandboxed Executor entirely. The path is
+// confinement-verified HERE (resolve under the canonical root via os.Root —
+// symlink escapes and traversal are rejected with ErrHostCacheEscape;
+// directories and other non-regular files with ErrHostCacheNotRegular), so
+// the guarantee holds regardless of caller diligence.
+//
+// Boundary statement (impl review): this confines reads to the toolcache
+// TREE. It does not prove spill provenance (that a path was issued by
+// Wakil in a spill marker) — a path the model invents under the root still
+// reads, but can only contain Wakil-generated content, and the random
+// CreateTemp suffix makes guessing one infeasible.
 func ReadHostCacheFile(path string) (string, error) {
-	b, err := os.ReadFile(path)
+	r, rel, fi, err := resolveHostCachePath(path)
+	if err != nil {
+		return "", err
+	}
+	defer r.Close()
+	if !fi.Mode().IsRegular() {
+		return "", fmt.Errorf("%w: %s", ErrHostCacheNotRegular, path)
+	}
+	f, err := r.Open(rel)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	b, err := io.ReadAll(f)
 	if err != nil {
 		return "", err
 	}
@@ -184,13 +301,18 @@ func ReadHostCacheFile(path string) (string, error) {
 // StatHostCacheFile returns the byte size of a toolcache spill file directly
 // from the host filesystem (no Executor round-trip) — the toolcache-path
 // counterpart to Executor.StatFile, used by read_file/read_file_full's
-// pre-read size guards.
+// pre-read size guards. Shares resolveHostCachePath with ReadHostCacheFile,
+// so the size guard measures the same confined entry the read will serve.
 func StatHostCacheFile(path string) (int64, error) {
-	info, err := os.Stat(path)
+	r, _, fi, err := resolveHostCachePath(path)
 	if err != nil {
 		return 0, err
 	}
-	return info.Size(), nil
+	r.Close()
+	if !fi.Mode().IsRegular() {
+		return 0, fmt.Errorf("%w: %s", ErrHostCacheNotRegular, path)
+	}
+	return fi.Size(), nil
 }
 
 // spillToDisk writes content to a uniquely-named temp file under cacheDir and
