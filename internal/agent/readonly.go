@@ -34,9 +34,11 @@ var readOnlyCmds = map[string]bool{
 	"grep": true, "egrep": true, "fgrep": true, "rg": true, "ag": true, "ack": true,
 	"ls": true, "ll": true, "find": true, "fd": true, "tree": true, "pwd": true, "cd": true,
 	"wc": true, "stat": true, "file": true, "du": true, "df": true, "cut": true, "comm": true,
-	"echo": true, "printf": true, "which": true, "type": true, "command": true,
+	"echo": true, "printf": true, "which": true, "type": true,
 	"whoami": true, "id": true, "hostname": true, "uname": true, "date": true,
 	"printenv": true, "basename": true, "dirname": true,
+	// NB: "command" is deliberately NOT allowlisted — POSIX command executes
+	// its argument ("command rm -rf x" would be arbitrary execution).
 	"readlink": true, "realpath": true, "diff": true, "cmp": true, "column": true,
 	"od": true, "xxd": true, "hexdump": true, "strings": true, "ps": true,
 	"less": true, "more": true, "seq": true, "true": true, "false": true,
@@ -102,14 +104,18 @@ func IsDestructiveShell(cmd string) bool {
 		if i >= len(fields) {
 			continue
 		}
-		bin := fields[i]
+		bin := unquoteShellArg(fields[i])
 		if j := strings.LastIndex(bin, "/"); j >= 0 {
 			bin = bin[j+1:]
 		}
 		if destructiveCmds[bin] {
 			return true
 		}
-		args := fields[i+1:]
+		rawArgs := fields[i+1:]
+		args := make([]string, len(rawArgs))
+		for k, a := range rawArgs {
+			args[k] = unquoteShellArg(a)
+		}
 		switch bin {
 		case "git":
 			if len(args) == 0 {
@@ -184,6 +190,58 @@ func IsDestructiveShell(cmd string) bool {
 	return false
 }
 
+// unquoteShellArg strips symmetric surrounding single or double quotes from a
+// token. The shell removes quotes before a binary sees its argv, so a quoted
+// `"-delete"` arrives at find as -delete; flag matching must see the same
+// tokens the shell will pass, or quoted destructive flags evade classification
+// while still executing.
+func unquoteShellArg(s string) string {
+	if len(s) >= 2 {
+		if (s[0] == '\'' && s[len(s)-1] == '\'') || (s[0] == '"' && s[len(s)-1] == '"') {
+			return s[1 : len(s)-1]
+		}
+	}
+	return s
+}
+
+// hasExpansionOrEscape reports whether a token contains shell constructs this
+// first-token classifier cannot model: variable/parameter expansion ($VAR,
+// ${x}, $'...'), backslash escapes, brace expansion ({a,b}), or INTERIOR
+// quotes (adjacent fragments concatenate: -de""lete reaches find as -delete;
+// the token keeps its quotes so the denylist check misses it). Outer symmetric
+// quotes are already stripped by unquoteShellArg, so ordinary quoted arguments
+// (find . -name '*.go') still classify. Any surviving construct gates the
+// command (fail closed) — convenience trades against not admitting obfuscated
+// flags past denylist-model commands.
+func hasExpansionOrEscape(tok string) bool {
+	return strings.ContainsAny(tok, `$\'"{}`+"`")
+}
+
+// envPrefixName extracts the variable name from a leading VAR=value token.
+func envPrefixName(tok string) string {
+	if j := strings.Index(tok, "="); j > 0 {
+		return tok[:j]
+	}
+	return ""
+}
+
+// dangerousEnvPrefix reports whether an env assignment can influence execution
+// of allowlisted readers via helpers/pagers/dynamic linking: GIT_* (external
+// diff, ssh command, pager), *PAGER*/*PAGER, LESS* (LESSOPEN pipes),
+// LD_*/DYLD_* (library injection), PATH (binary resolution).
+func dangerousEnvPrefix(name string) bool {
+	if name == "PATH" || strings.HasPrefix(name, "LD_") || strings.HasPrefix(name, "DYLD_") {
+		return true
+	}
+	if strings.HasPrefix(name, "GIT_") || strings.HasPrefix(name, "LESS") {
+		return true
+	}
+	if strings.Contains(name, "PAGER") {
+		return true
+	}
+	return false
+}
+
 // isReadOnlyShell reports whether a shell command is safe to treat as read-only:
 // every chained/piped segment starts with an allowlisted binary, none carry a
 // known destructive flag, and the command has no output redirection or command
@@ -206,22 +264,44 @@ func IsReadOnlyShell(cmd string) bool {
 	}
 	for _, seg := range segs {
 		fields := strings.Fields(seg)
-		// Skip leading "VAR=value" env assignments before the binary.
+		// Skip leading "VAR=value" env assignments before the binary, but only
+		// ones that cannot influence execution (helpers, pagers, linking,
+		// binary resolution). GIT_SSH_COMMAND=rm git ls-remote must not auto-run.
 		i := 0
 		for i < len(fields) && !strings.HasPrefix(fields[i], "-") && strings.Contains(fields[i], "=") {
+			if name := envPrefixName(fields[i]); dangerousEnvPrefix(name) {
+				return false
+			}
 			i++
 		}
 		if i >= len(fields) {
 			return false
 		}
-		bin := fields[i]
+		bin := unquoteShellArg(fields[i])
 		if j := strings.LastIndex(bin, "/"); j >= 0 {
 			bin = bin[j+1:] // strip any path prefix
 		}
 		if !readOnlyCmds[bin] {
 			return false
 		}
-		if !readFlagsOK(bin, fields[i+1:]) {
+		rawArgs := fields[i+1:]
+		args := make([]string, len(rawArgs))
+		for k, a := range rawArgs {
+			args[k] = unquoteShellArg(a)
+		}
+		// Tokens still carrying expansion/escape/brace/interior-quote constructs
+		// after outer-quote stripping are opaque to this classifier — gate it.
+		// (Checked AFTER unquoting: fully-quoted args like '*.go' are safe;
+		// fragments like -de""lete keep interior quotes and gate.)
+		if hasExpansionOrEscape(bin) {
+			return false
+		}
+		for _, a := range args {
+			if hasExpansionOrEscape(a) {
+				return false
+			}
+		}
+		if !readFlagsOK(bin, args) {
 			return false
 		}
 	}
@@ -258,22 +338,74 @@ func readFlagsOK(bin string, args []string) bool {
 		switch args[0] {
 		case "diff", "status", "log", "show", "blame", "shortlog",
 			"ls-files", "ls-tree", "rev-parse", "describe", "name-rev",
-			"reflog", "diff-tree", "cat-file", "ls-remote", "for-each-ref",
-			"rev-list", "grep", "range-diff", "merge-base", "cherry":
-			return true
-		case "branch":
-			// "git branch" (list) and "git branch -v" are reads; "git branch -D"
-			// is destructive (caught by IsDestructiveShell). Allow unless a
-			// mutating flag is present.
+			"diff-tree", "cat-file", "ls-remote", "for-each-ref",
+			"rev-list", "range-diff", "merge-base", "cherry":
+			// "diff --output=FILE" writes a file; --ext-diff / --textconv run
+			// configured helper binaries. Everything else stays read-only.
 			for _, a := range args[1:] {
-				if a == "-D" || a == "-d" || a == "--delete" {
+				if strings.HasPrefix(a, "--output") || a == "--ext-diff" ||
+					a == "--no-textconv" || a == "--textconv" {
+					return false
+				}
+			}
+			return true
+		case "reflog":
+			// Only bare inspection is read-only. "reflog expire" rewrites/
+			// truncates reflog entries; "reflog delete" removes them. Any
+			// subcommand other than none/"show"/"list" gates; show/list inherit
+			// log machinery, so --output gates too.
+			if len(args) == 1 {
+				return true
+			}
+			switch args[1] {
+			case "show", "list":
+				for _, a := range args[2:] {
+					if strings.HasPrefix(a, "--output") {
+						return false
+					}
+				}
+				return true
+			}
+			return false
+		case "branch":
+			// Strict allowlist of branch-READING forms; anything not matching
+			// exactly gates (creation by positional, rename -m/-M, copy -c/-C,
+			// delete -d/-D/--delete, force -f/--force, upstream -u/--set-*
+			// all fall through to a confirm prompt). Unknown/combined flags
+			// also gate — exact match only, no prefix or bundle acceptance.
+			// NB: "-l" is NOT here — on git branch it means "create reflog".
+			allowed := map[string]bool{
+				"-a": true, "-v": true, "-vv": true, "-r": true,
+				"--list": true, "--show-current": true, "--all": true,
+				"--remotes": true, "--column": true, "--no-column": true,
+			}
+			for _, a := range args[1:] {
+				if !allowed[a] {
+					return false
+				}
+			}
+			return true
+		case "grep":
+			// git grep -O / --open-files-in-pager launches a pager binary.
+			for _, a := range args[1:] {
+				if a == "-O" || strings.HasPrefix(a, "--open-files-in-pager") {
 					return false
 				}
 			}
 			return true
 		case "stash":
-			// Only "stash list" is read-only; push/pop/apply/drop/clear are not.
-			return len(args) >= 2 && args[1] == "list"
+			// Only "stash list" is read-only (and it inherits the --output
+			// write vector from log machinery — gate it too); push/pop/apply/
+			// drop/clear are not reads.
+			if len(args) < 2 || args[1] != "list" {
+				return false
+			}
+			for _, a := range args[2:] {
+				if strings.HasPrefix(a, "--output") {
+					return false
+				}
+			}
+			return true
 		case "config":
 			// Only "config --get" is read-only; "config --set" writes.
 			for _, a := range args[1:] {
@@ -284,6 +416,42 @@ func readFlagsOK(bin string, args []string) bool {
 			return false
 		}
 		return false // unrecognized subcommand → gate it
+	case "xxd":
+		// "xxd in out" writes a second positional output file; one positional
+		// (stdout dump) is a read. Conservative: any non-flag token counts as
+		// a positional, including numeric option operands (-l 16 → "16").
+		pos := 0
+		for _, a := range args {
+			if !strings.HasPrefix(a, "-") {
+				pos++
+			}
+		}
+		if pos >= 2 {
+			return false
+		}
+	case "less", "more", "tree":
+		// less/tree output-file flags (short and long forms).
+		for _, a := range args {
+			switch {
+			case strings.HasPrefix(a, "-o"), strings.HasPrefix(a, "-O"),
+				strings.HasPrefix(a, "--log-file"):
+				return false
+			}
+		}
+	case "rg":
+		// rg --pre=CMD runs a preprocessor binary; --hostname-bin runs one too.
+		for _, a := range args {
+			if strings.HasPrefix(a, "--pre") || strings.HasPrefix(a, "--hostname-bin") {
+				return false
+			}
+		}
+	case "ag", "ack":
+		// --pager CMD / +CMD launch a pager process.
+		for _, a := range args {
+			if strings.HasPrefix(a, "--pager") || strings.HasPrefix(a, "+") {
+				return false
+			}
+		}
 	case "find", "fd":
 		for _, a := range args {
 			switch a {
@@ -294,9 +462,9 @@ func readFlagsOK(bin string, args []string) bool {
 			}
 		}
 	case "yq":
-		// yq -i / --inplace edits the file in place
+		// yq -i / --inplace edits in place; -s/--split-exp writes multiple files.
 		for _, a := range args {
-			if a == "-i" || a == "--inplace" {
+			if a == "-i" || a == "--inplace" || a == "-s" || strings.HasPrefix(a, "--split-exp") {
 				return false
 			}
 		}

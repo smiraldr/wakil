@@ -605,6 +605,37 @@ func TestIsReadOnlyShell_Adversarial(t *testing.T) {
 		``, `   `,
 		// docker mutations
 		`docker system prune -af`, `docker rm foo`,
+		// H1 audit 2026-09-21: "command" executes its argument (removed from allowlist)
+		`command rm -rf .`, `command -v rm`, `command git push --force`,
+		// git branch mutations through the strict read-allowlist
+		`git branch newbranch`, `git branch -m a b`, `git branch -M a b`,
+		`git branch -c a b`, `git branch --set-upstream-to=origin/main`,
+		`git branch -d x`, `git branch --delete x`, `git branch -f x HEAD`,
+		`git branch -l x`,                   // -l = create reflog, not list
+		`git branch -av && git branch evil`, // read prefix + write tail
+		`git branch "-D" x`,                 // quoted flag: shell strips quotes before exec
+		`find . "-delete"`,                  // quoted flag evasion
+		`sed "-i" s/a/b/ f`,                 // quoted flag evasion
+		// git diff/reflog write vectors (H1 audit)
+		`git diff --output=patch.txt`, `git diff --output patch.txt`,
+		`git reflog expire --expire=now --all`, `git reflog delete HEAD@{0}`,
+		// output-file flags on allowlisted readers
+		`xxd in.bin out.bin`, `less -o out.txt in.txt`, `tree -o out.txt .`,
+		`rg --pre=helper pattern .`,
+		// H1 impl-review: expansion/escape obfuscation resolves in the shell
+		// before exec — classifier must fail closed on such tokens.
+		"find . -de\"\"lete", `find . -\delete`, `find . "-de"lete`,
+		"find . -del''ete", `find . $'-delete'`, `find . -${x}delete`,
+		`find . -d{elete,}`, `sed -\i s/a/b/ f`,
+		// env prefixes that influence execution of allowlisted readers
+		`GIT_SSH_COMMAND=rm git ls-remote origin`, `GIT_EXTERNAL_DIFF=cmd git diff`,
+		`GIT_PAGER=evil git log`, `LESSOPEN='|evil %s' less f`, `PATH=/evil ls`,
+		`PAGER=evil git log`,
+		// helper/output vectors on inspection subcommands
+		`git diff --ext-diff`, `git grep -O pattern`, `git grep --open-files-in-pager p`,
+		`git reflog show --output=f.txt`, `git stash list --output=f.txt`,
+		`less --log-file=out.log f`, `yq -s '.[]' f.yaml`, `rg --hostname-bin=cmd p .`,
+		`ag --pager cmd pattern`,
 	}
 	for _, cmd := range mustBeWrite {
 		if IsReadOnlyShell(cmd) {
@@ -648,6 +679,28 @@ func TestIsReadOnlyShell_Adversarial(t *testing.T) {
 	gitReadOnly := []string{
 		`git status`, `git log --oneline -5`, `git diff`, `git status && git diff`,
 		`git show HEAD`, `git blame file.go`, `git diff --stat`,
+		`git branch`, `git branch -a`, `git branch -v`, `git branch -vv`,
+		`git branch -r`, `git branch --list`, `git branch --show-current`,
+		`git branch -a -v`, `git reflog`, `git reflog show`, `git reflog list`,
+		// positive regressions for the H1 hardening (must stay reads)
+		`git diff --ext-diff=false`, `git grep -n pattern`, `xxd f.bin`,
+		`xxd -r -p`, `less f.txt`, `tree .`, `rg pattern .`,
+	}
+
+	// Over-gating pins (H1 impl review): reads that now prompt due to the
+	// conservative grammar. If one of these flips to true later, verify the
+	// enabling form cannot smuggle a write/exec first, then move it to the
+	// appropriate table above with a justification.
+	conservativeGated := []string{
+		`git branch --list 'pat*'`, `git branch --contains HEAD`,
+		`git branch -avv`, `git branch -av`, `git reflog -n 5`, `git reflog --all`,
+		`git diff --output-indicator-new=+`,
+		`echo $HOME`, `grep "$pat" f`, `LESSOPEN='|x %s' true`,
+	}
+	for _, cmd := range conservativeGated {
+		if IsReadOnlyShell(cmd) {
+			t.Errorf("IsReadOnlyShell(%q) = true — was conservative-gated; classifier loosened?", cmd)
+		}
 	}
 	for _, cmd := range gitReadOnly {
 		if !IsReadOnlyShell(cmd) {
@@ -659,6 +712,7 @@ func TestIsReadOnlyShell_Adversarial(t *testing.T) {
 	gitMutating := []string{
 		`git add .`, `git commit -m msg`, `git stash`, `git stash pop`,
 		`git merge main`, `git rebase main`, `git checkout main`,
+		`git branch newbranch`, `git branch -m a b`, `git branch --delete x`,
 	}
 	for _, cmd := range gitMutating {
 		if IsReadOnlyShell(cmd) {

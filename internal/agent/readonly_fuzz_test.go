@@ -21,30 +21,34 @@ import (
 func FuzzShellClassify(f *testing.F) {
 	// Seed corpus — structured to hit each classifier's branches.
 	seeds := []string{
-		"",                       // empty
-		"   ",                    // whitespace-only
-		"ls",                     // read-only
-		"cat file",               // read-only
-		"/bin/ls -la",            // read-only with path
-		"rm -rf /",               // destructive
-		"echo hi > file",         // destructive (redirection)
-		"echo `rm x`",            // destructive (backtick)
-		"echo $(rm x)",           // destructive (command substitution)
-		"ls && rm -rf x",         // destructive (chained)
-		"cat a | grep b",         // read-only (pipe)
-		"X=1 rm -rf /",           // destructive (env prefix)
-		"VAR=val ls",             // read-only (env prefix)
-		"git reset --hard",       // destructive (git subcommand)
-		"git push --force",       // destructive (git flag)
-		"find . -delete",         // destructive (find flag)
-		"find . -exec rm {} \\;", // destructive (find exec)
-		"sed -i 's/a/b/' file",   // destructive (sed in-place)
-		"chmod -R 755 dir",       // destructive (chmod recursive)
-		"echo 'rm is a command'", // read-only (quoted, first token echo)
-		"sudo ls",                // not read-only (sudo not in allowlist)
-		"\x00\xff\xfe",           // invalid UTF-8
-		"strings.Repeat",         // not a command
-		"a&&b||c|d;e&f\ng",       // operators + newline
+		"",                        // empty
+		"   ",                     // whitespace-only
+		"ls",                      // read-only
+		"cat file",                // read-only
+		"/bin/ls -la",             // read-only with path
+		"rm -rf /",                // destructive
+		"echo hi > file",          // destructive (redirection)
+		"echo `rm x`",             // destructive (backtick)
+		"echo $(rm x)",            // destructive (command substitution)
+		"ls && rm -rf x",          // destructive (chained)
+		"cat a | grep b",          // read-only (pipe)
+		"X=1 rm -rf /",            // destructive (env prefix)
+		"VAR=val ls",              // read-only (env prefix)
+		"git reset --hard",        // destructive (git subcommand)
+		"git push --force",        // destructive (git flag)
+		"find . -delete",          // destructive (find flag)
+		"find . -exec rm {} \\;",  // destructive (find exec)
+		"sed -i 's/a/b/' file",    // destructive (sed in-place)
+		"chmod -R 755 dir",        // destructive (chmod recursive)
+		"echo 'rm is a command'",  // read-only (quoted, first token echo)
+		"sudo ls",                 // not read-only (sudo not in allowlist)
+		"command rm -rf /tmp/x",   // H1: command executes its argument
+		"git branch -m a b",       // H1: branch rename
+		"git branch \"-D\" x",     // H1: quoted flag
+		"git diff --output=f.txt", // H1: diff file output
+		"\x00\xff\xfe",            // invalid UTF-8
+		"strings.Repeat",          // not a command
+		"a&&b||c|d;e&f\ng",        // operators + newline
 	}
 	for _, s := range seeds {
 		f.Add(s)

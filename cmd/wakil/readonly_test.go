@@ -54,6 +54,13 @@ func TestIsReadOnlyShell(t *testing.T) {
 		"fd . --exec-batch rm",       // fd exec-batch (long form)
 		"cat <(grep needle file)",    // process substitution
 		"diff <(cat a) <(cat b)",     // process substitution
+		// H1 audit 2026-09-21
+		"command rm -rf foo",      // command executes its argument
+		"git branch newbranch",    // branch creation
+		"git branch -m a b",       // branch rename
+		"git reflog expire --all", // reflog mutation
+		"find . \"-delete\"",      // quoted flag (shell strips quotes)
+		"git diff --output=p.txt", // diff writes a file
 	}
 	for _, c := range writes {
 		if agent.IsReadOnlyShell(c) {
@@ -111,6 +118,7 @@ func TestIsDestructiveShell(t *testing.T) {
 		{"cat file.txt", "cat"},
 		{"grep -r 'foo' .", "grep"},
 		{"git status", "git status"},
+		{"git branch -a", "branch listing is a read"},
 		{"go build ./...", "go build"},
 		{`echo "rm is a command"`, "rm inside quoted string"},
 		{"find . -name '*.log'", "find without -delete"},
