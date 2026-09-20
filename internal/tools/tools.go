@@ -102,9 +102,11 @@ func DefaultTools(cwd string) []proxy.Tool {
 		}},
 		{Type: "function", Function: proxy.ToolFunction{
 			Name:        "list_dir",
-			Description: "List the entries of a directory (names, with a trailing / on subdirectories). Use this to discover what exists before reading files. " + cwdNote,
+			Description: "List the entries of a directory (names, with a trailing / on subdirectories). Use this to discover what exists before reading files. " +
+				"Pass include_stats=true to also show file sizes and directory file counts + aggregate sizes (capped at 200 entries, .git/ and node_modules/ excluded from aggregation). " + cwdNote,
 			Parameters: SchemaObj(map[string]interface{}{
-				"path": StrProp("Directory to list (defaults to the working directory)"),
+				"path":          StrProp("Directory to list (defaults to the working directory)"),
+				"include_stats": BoolProp("When true, include file sizes and directory aggregate stats (file count + total size). Capped at 200 entries."),
 			}),
 		}},
 		{Type: "function", Function: proxy.ToolFunction{
@@ -279,9 +281,11 @@ func DiscoveryTools(cwd string) []proxy.Tool {
 		{Type: "function", Function: proxy.ToolFunction{
 			Name: "list_dir",
 			Description: "List the entries of a directory (names, with a trailing / on subdirectories). " +
-				"Use this to discover what files exist before reading them. " + cwdNote,
+				"Use this to discover what files exist before reading them. " +
+				"Pass include_stats=true to also show file sizes and directory file counts + aggregate sizes (capped at 200 entries, .git/ and node_modules/ excluded from aggregation). " + cwdNote,
 			Parameters: SchemaObj(map[string]interface{}{
-				"path": StrProp("Directory to list (defaults to the working directory)."),
+				"path":          StrProp("Directory to list (defaults to the working directory)."),
+				"include_stats": BoolProp("When true, include file sizes and directory aggregate stats (file count + total size). Capped at 200 entries."),
 			}),
 		}},
 	}
@@ -381,9 +385,11 @@ func EditTools(cwd string) []proxy.Tool {
 		{Type: "function", Function: proxy.ToolFunction{
 			Name: "list_dir",
 			Description: "List the entries of a directory (names, with a trailing / on subdirectories). " +
-				"Use this to discover what files exist before reading them. " + cwdNote,
+				"Use this to discover what files exist before reading them. " +
+				"Pass include_stats=true to also show file sizes and directory file counts + aggregate sizes (capped at 200 entries, .git/ and node_modules/ excluded from aggregation). " + cwdNote,
 			Parameters: SchemaObj(map[string]interface{}{
-				"path": StrProp("Directory to list (defaults to the working directory)."),
+				"path":          StrProp("Directory to list (defaults to the working directory)."),
+				"include_stats": BoolProp("When true, include file sizes and directory aggregate stats (file count + total size). Capped at 200 entries."),
 			}),
 		}},
 		{Type: "function", Function: proxy.ToolFunction{

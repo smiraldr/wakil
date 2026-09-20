@@ -839,7 +839,8 @@ func (a *App) handleReadFileFull(ctx context.Context, tc proxy.ToolCall) string 
 // handleListDir lists directory contents after path confinement.
 func (a *App) handleListDir(ctx context.Context, tc proxy.ToolCall) string {
 	var args struct {
-		Path string `json:"path"`
+		Path         string `json:"path"`
+		IncludeStats bool   `json:"include_stats"`
 	}
 	if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
 		return fmt.Sprintf("ERROR: could not parse arguments: %v", err)
@@ -847,6 +848,9 @@ func (a *App) handleListDir(ctx context.Context, tc proxy.ToolCall) string {
 	canonical, err := a.Exec.ConfinePath(ctx, args.Path)
 	if err != nil {
 		return "ERROR: " + err.Error()
+	}
+	if args.IncludeStats {
+		return a.handleListDirWithStats(ctx, canonical)
 	}
 	out, err := a.Exec.ListDir(ctx, canonical)
 	return formatResult(out, err)
