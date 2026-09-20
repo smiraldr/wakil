@@ -176,7 +176,7 @@ func (a *App) handleSaveSkill(ctx context.Context, tc proxy.ToolCall) string {
 	if err := validateSkillValue(value); err != nil {
 		return "ERROR: " + err.Error()
 	}
-	if !a.Confirm("save_skill", "Save new skill to the global store?", args.Key, false) {
+	if !a.Confirm("save_skill", fmt.Sprintf("Save new skill %q to the global store?", args.Key), fmt.Sprintf("Size: %d bytes\nTainted: %s\n\nContent preview:\n%s", len(value), taintLabel(a.computeTainted()), previewSkillValue(value)), false) {
 		return "[declined by user]"
 	}
 	e, err := s.putActiveSkill(ctx, args.Key, value, a.AgentPrefix, a.chatID(), a.computeTainted(), false, "")
@@ -209,7 +209,9 @@ func (a *App) handleUpdateSkill(ctx context.Context, tc proxy.ToolCall) string {
 		return fmt.Sprintf("ERROR: could not parse arguments: %v", err)
 	}
 	// Must already exist — update is not create.
-	if _, err := s.getActiveSkill(ctx, args.Key); err == memory.ErrNotFound {
+	// Fetch the existing content for the diff preview.
+	existingEntry, err := s.getActiveSkill(ctx, args.Key)
+	if err == memory.ErrNotFound {
 		return "ERROR: skill not found: " + args.Key + " — use save_skill to create it"
 	} else if err != nil {
 		return fmt.Sprintf("ERROR: update skill: %v", err)
@@ -225,7 +227,7 @@ func (a *App) handleUpdateSkill(ctx context.Context, tc proxy.ToolCall) string {
 	if err := validateSkillValue(value); err != nil {
 		return "ERROR: " + err.Error()
 	}
-	if !a.Confirm("update_skill", "Update skill in the global store (old version kept in history)?", args.Key, false) {
+	if !a.Confirm("update_skill", fmt.Sprintf("Update skill %q in the global store (old version kept in history)?", args.Key), fmt.Sprintf("Old: %d bytes\nNew: %d bytes\nTainted: %s\n\nNew content preview:\n%s", len(existingEntry.Value), len(value), taintLabel(a.computeTainted()), previewSkillValue(value)), false) {
 		return "[declined by user]"
 	}
 	e, err := s.putActiveSkill(ctx, args.Key, value, a.AgentPrefix, a.chatID(), a.computeTainted(), true, "")
@@ -260,12 +262,13 @@ func (a *App) handleForgetSkill(ctx context.Context, tc proxy.ToolCall) string {
 	if err := validateSkillKey(args.Key); err != nil {
 		return "ERROR: " + err.Error()
 	}
-	if _, err := s.getActiveSkill(ctx, args.Key); err == memory.ErrNotFound {
+	existingEntry, err := s.getActiveSkill(ctx, args.Key)
+	if err == memory.ErrNotFound {
 		return "ERROR: skill not found: " + args.Key
 	} else if err != nil {
 		return fmt.Sprintf("ERROR: forget skill: %v", err)
 	}
-	if !a.Confirm("forget_skill", "Forget skill from the global store (tombstone — still in history)?", args.Key, false) {
+	if !a.Confirm("forget_skill", fmt.Sprintf("Forget skill %q from the global store (tombstone — still in history)?", args.Key), fmt.Sprintf("Size: %d bytes\nTainted: %s", len(existingEntry.Value), taintLabel(existingEntry.Tainted)), false) {
 		return "[declined by user]"
 	}
 	if err := s.forgetSkill(ctx, args.Key); err == memory.ErrNotFound {
@@ -316,4 +319,32 @@ func plural(n int) string {
 		return ""
 	}
 	return "s"
+}
+
+// previewSkillValue returns a truncated preview of skill content for use in
+// confirm dialogs. Shows the first 500 bytes (UTF-8 safe) with an ellipsis
+// if longer.
+func previewSkillValue(value string) string {
+	const previewMax = 500
+	if len(value) <= previewMax {
+		return value
+	}
+	// Find the last rune boundary at or before previewMax.
+	end := previewMax
+	for end > 0 && (value[end]&0xC0) == 0x80 {
+		end--
+	}
+	return value[:end] + "…[" + fmt.Sprintf("%d", len(value)-end) + " more bytes]"
+}
+
+// taintLabel returns a human-readable string for the tainted state.
+func taintLabel(tainted int) string {
+	switch tainted {
+	case memory.TaintTrue:
+		return "yes (external content)"
+	case memory.TaintFalse:
+		return "no"
+	default:
+		return "unknown"
+	}
 }
