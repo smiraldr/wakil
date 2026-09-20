@@ -120,20 +120,29 @@ func (a *App) SetCtxLimit(lim ContextLimit) {
 }
 
 // SetModelList replaces the model list used for /model and /submodel
-// autocomplete.
+// autocomplete. Acquires stateMu so concurrent readers (Snapshot, Info) are
+// synchronized.
 func (a *App) SetModelList(models []string) {
+	a.stateMu.Lock()
 	a.ModelList = models
+	a.stateMu.Unlock()
 }
 
 // SetTools replaces the tool list (e.g. after an MCP reconnect rebuilds it).
+// Acquires stateMu so concurrent readers (Snapshot) are synchronized.
 func (a *App) SetTools(tools []proxy.Tool) {
+	a.stateMu.Lock()
 	a.Tools = tools
+	a.stateMu.Unlock()
 }
 
 // ReplacePendingImages replaces the pending-image slice wholesale. It copies the
 // input slice so the caller's backing array is not retained (a caller mutating
-// its slice afterward must not change App state).
+// its slice afterward must not change App state). Acquires stateMu so
+// concurrent readers (Snapshot) are synchronized.
 func (a *App) ReplacePendingImages(imgs []proxy.ImagePart) {
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
 	if imgs == nil {
 		a.PendingImages = nil
 		return
@@ -141,12 +150,18 @@ func (a *App) ReplacePendingImages(imgs []proxy.ImagePart) {
 	a.PendingImages = append([]proxy.ImagePart(nil), imgs...)
 }
 
-// AddPendingImage appends one pending image.
+// AddPendingImage appends one pending image. Acquires stateMu so concurrent
+// readers (Snapshot) are synchronized.
 func (a *App) AddPendingImage(img proxy.ImagePart) {
+	a.stateMu.Lock()
 	a.PendingImages = append(a.PendingImages, img)
+	a.stateMu.Unlock()
 }
 
-// ClearPendingImages drops all pending images.
+// ClearPendingImages drops all pending images. Acquires stateMu so concurrent
+// readers (Snapshot) are synchronized.
 func (a *App) ClearPendingImages() {
+	a.stateMu.Lock()
 	a.PendingImages = nil
+	a.stateMu.Unlock()
 }

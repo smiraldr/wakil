@@ -560,6 +560,30 @@ func (a *App) ModelListLocked() []string {
 	return append([]string(nil), a.ModelList...)
 }
 
+// AssistEnabledLocked returns AssistEnabled under stateMu.RLock.
+// The field is toggled by the TUI (/assist command) and read by the turn
+// goroutine (assist.go) — the lock prevents the race.
+func (a *App) AssistEnabledLocked() bool {
+	a.stateMu.RLock()
+	defer a.stateMu.RUnlock()
+	return a.AssistEnabled
+}
+
+// AssistAutoLocked returns AssistAuto under stateMu.RLock.
+func (a *App) AssistAutoLocked() bool {
+	a.stateMu.RLock()
+	defer a.stateMu.RUnlock()
+	return a.AssistAuto
+}
+
+// StateRLock acquires stateMu.RLock. Exported for cross-package callers
+// (wiringFacade) that need to read multiple stateMu-guarded fields
+// atomically under a single lock acquisition. Must not be held across
+// method calls that may acquire locks, perform I/O, or invoke callbacks
+// (see the lock-ordering comment at the top of this file).
+func (a *App) StateRLock()   { a.stateMu.RLock() }
+func (a *App) StateRUnlock() { a.stateMu.RUnlock() }
+
 // indexByte is a local strings.IndexByte to avoid importing strings here
 // (keeps the import list clean — strings is already imported in other files).
 func indexByte(s string, b byte) int {

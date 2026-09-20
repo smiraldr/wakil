@@ -199,27 +199,41 @@ func (f *wiringFacade) Snapshot() sessionclient.ClientSnapshot {
 	sessionID := f.sessionID
 	f.mu.Unlock()
 	app := f.app
-	title := ""
+
+	// Read stateMu-guarded fields under a single RLock. All fields that
+	// have RPC or worker-goroutine writers go here. Costs is a pointer
+	// set once at construction — safe without the lock.
+	app.StateRLock()
+	selectedBackend := app.SelectedBackend
+	rawTools := app.RawTools
+	ctxLimit := app.CtxLimit
+	modelList := append([]string(nil), app.ModelList...)
+	tools := append([]proxy.Tool(nil), app.Tools...)
+	pendingImages := append([]proxy.ImagePart(nil), app.PendingImages...)
+	var title string
 	if app.Session != nil {
 		title = app.Session.Label
 	}
+	wf := app.Workflow
+	app.StateRUnlock()
+
 	return sessionclient.ClientSnapshot{
 		SessionID:     sessionID,
 		ChatID:        app.Client.ChatID,
 		Title:         title,
 		Workspace:     app.SessionWorkspace(),
-		Backend:       app.SelectedBackend,
+		Backend:       selectedBackend,
 		Model:         app.EffectiveModel(),
 		Conv:          app.ConvSnapshot(),
-		ContextLimit:  toClientContextLimit(app.CtxLimit),
-		ModelList:     append([]string(nil), app.ModelList...),
+		ContextLimit:  toClientContextLimit(ctxLimit),
+		ModelList:     modelList,
 		BackendList:   toClientBackends(app.BackendList),
-		Tools:         append([]proxy.Tool(nil), app.Tools...),
-		PendingImages: append([]proxy.ImagePart(nil), app.PendingImages...),
-		RawTools:      app.RawTools,
+		Tools:         tools,
+		PendingImages: pendingImages,
+		RawTools:      rawTools,
 		OutputMode:    app.Cfg.OutputMode,
 		Costs:         app.Costs,
-		Workflow:      toClientWorkflow(app),
+		Workflow:      workflowSnapshot(wf),
 		Version:       version,
 	}
 }
@@ -249,6 +263,36 @@ func (f *wiringFacade) Info() sessionclient.InfoSnapshot {
 	// Use ConvStats() which holds the read lock internally.
 	convLen, convSize := app.ConvStats()
 
+	// Read stateMu-guarded fields under a single RLock to avoid racing
+	// with RPC writers (SetSelectedBackend, SetRawToolsValue,
+	// SetInfoPanelOpen, /assist toggle). Costs is a *proxy.CostTracker
+	// pointer set once at construction and never reassigned — safe to
+	// read without a lock. EffectiveModel() and EffectiveSubagentModel()
+	// acquire stateMu.RLock internally.
+	app.StateRLock()
+	selectedBackend := app.SelectedBackend
+	rawTools := app.RawTools
+	assistEnabled := app.AssistEnabled
+	assistAuto := app.AssistAuto
+	infoPanelOpen := app.InfoPanelOpen
+	wf := app.Workflow
+	// Copy config fields needed by mashuraPanelLabel under the lock to
+	// avoid a whole-Cfg struct copy racing with stateMu-guarded Cfg
+	// field writes (SetMaxParallel, applyModelOverrideLocked). These
+	// specific fields are never written at runtime, but the struct copy
+	// reads sibling fields that are.
+	oracleEnabled := app.Cfg.OracleEnabled
+	oracleAPIKeyEnv := app.Cfg.OracleAPIKeyEnv
+	mashuraToolPanels := app.Cfg.MashuraToolPanels
+	mashuraPanels := app.Cfg.MashuraPanels
+	oracleModel := app.Cfg.OracleModel
+	// SidebarLabel may read mutable workflow state — copy under lock.
+	var workflowLabel string
+	if wf != nil {
+		workflowLabel = wf.SidebarLabel()
+	}
+	app.StateRUnlock()
+
 	info := sessionclient.InfoSnapshot{
 		ChatID:          app.Client.ChatID,
 		BaseURL:         app.Client.BaseURL,
@@ -256,7 +300,7 @@ func (f *wiringFacade) Info() sessionclient.InfoSnapshot {
 		LastLatencyMs:   app.Client.LastLatencyMs(),
 		Cwd:             app.Exec.Cwd(),
 		ExecMode:        app.Exec.Describe(),
-		SelectedBackend: app.SelectedBackend,
+		SelectedBackend: selectedBackend,
 		ConfigBackend:   app.Cfg.Backend,
 		EffectiveModel:  app.EffectiveModel(),
 		SubagentModel:   app.EffectiveSubagentModel(),
@@ -270,23 +314,23 @@ func (f *wiringFacade) Info() sessionclient.InfoSnapshot {
 		ConvLen:         convLen,
 		TranscriptSize:  convSize,
 		Costs:           app.Costs,
-		RawTools:        app.RawTools,
-		AssistEnabled:   app.AssistEnabled,
-		AssistAuto:      app.AssistAuto,
+		RawTools:        rawTools,
+		AssistEnabled:   assistEnabled,
+		AssistAuto:      assistAuto,
 	}
 
-	if app.Workflow != nil {
-		info.WorkflowLabel = app.Workflow.SidebarLabel()
+	if workflowLabel != "" {
+		info.WorkflowLabel = workflowLabel
 	}
-	info.InfoPanelOpen = app.InfoPanelOpen
+	info.InfoPanelOpen = infoPanelOpen
 
 	// Oracle label with the "no key" fallback the old TUI computed inline
 	// (env checks belong wiring-side, not in the render path).
-	if app.Cfg.OracleEnabled {
-		anthropicOk := os.Getenv(app.Cfg.OracleAPIKeyEnv) != ""
+	if oracleEnabled {
+		anthropicOk := os.Getenv(oracleAPIKeyEnv) != ""
 		openrouterOk := os.Getenv("OPENROUTER_API_KEY") != ""
 		if anthropicOk || openrouterOk {
-			info.OracleLabel = mashuraPanelLabel(app.Cfg)
+			info.OracleLabel = mashuraPanelLabelFromFields(mashuraToolPanels, mashuraPanels, oracleModel)
 		} else {
 			info.OracleLabel = "no key"
 		}
@@ -340,14 +384,22 @@ func (f *wiringFacade) Info() sessionclient.InfoSnapshot {
 // panel — moved from the TUI (info_panel.go) so the info snapshot can carry
 // it without the TUI reading config internals.
 func mashuraPanelLabel(cfg config.Config) string {
+	return mashuraPanelLabelFromFields(cfg.MashuraToolPanels, cfg.MashuraPanels, cfg.OracleModel)
+}
+
+// mashuraPanelLabelFromFields is the lock-free core of mashuraPanelLabel.
+// Callers who have already copied the relevant config fields under stateMu
+// use this to avoid a whole-Cfg struct copy that would race with
+// stateMu-guarded Cfg field writes.
+func mashuraPanelLabelFromFields(toolPanels map[string]string, panels map[string]config.MashuraPanelConfig, oracleModel string) string {
 	name := "default"
-	if cfg.MashuraToolPanels != nil {
-		if p := cfg.MashuraToolPanels["review"]; p != "" {
+	if toolPanels != nil {
+		if p := toolPanels["review"]; p != "" {
 			name = p
 		}
 	}
-	if cfg.MashuraPanels != nil {
-		if p, ok := cfg.MashuraPanels[name]; ok && len(p.Models) > 0 {
+	if panels != nil {
+		if p, ok := panels[name]; ok && len(p.Models) > 0 {
 			switch p.Mode {
 			case "fusion":
 				return fmt.Sprintf("fusion (%d models)", len(p.Models))
@@ -361,7 +413,7 @@ func mashuraPanelLabel(cfg config.Config) string {
 			}
 		}
 	}
-	return cfg.OracleModel
+	return oracleModel
 }
 
 // mashuraShortModel strips the "provider:" prefix for compact display.
@@ -481,7 +533,7 @@ func (f *wiringFacade) SaveRepoState(mutate func(*sessionclient.RepoStateMutator
 func (f *wiringFacade) SetInfoPanelOpen(open bool) { f.app.SetInfoPanelOpen(open); f.bumpVersion() }
 
 func (f *wiringFacade) SetCtxLimit(lim sessionclient.ContextLimit) {
-	f.app.CtxLimit = toAgentContextLimit(lim)
+	f.app.SetCtxLimit(toAgentContextLimit(lim))
 	f.bumpVersion()
 }
 
@@ -1067,14 +1119,21 @@ func toClientBackends(backends []agent.BackendInfo) []sessionclient.Backend {
 }
 
 func toClientWorkflow(app *agent.App) *sessionclient.WorkflowSnapshot {
-	if app.Workflow == nil {
+	return workflowSnapshot(app.Workflow)
+}
+
+// workflowSnapshot builds a WorkflowSnapshot from a WorkflowState pointer
+// without reading app.Workflow (the caller must have read the pointer under
+// the appropriate lock). Returns nil if wf is nil.
+func workflowSnapshot(wf *workflow.WorkflowState) *sessionclient.WorkflowSnapshot {
+	if wf == nil {
 		return nil
 	}
 	return &sessionclient.WorkflowSnapshot{
-		Task:      app.Workflow.Task,
-		Phase:     app.Workflow.PhaseName(),
-		StepCount: app.Workflow.StepCount,
-		StepIdx:   app.Workflow.StepIdx,
-		PlanPath:  app.Workflow.PlanPath,
+		Task:      wf.Task,
+		Phase:     wf.PhaseName(),
+		StepCount: wf.StepCount,
+		StepIdx:   wf.StepIdx,
+		PlanPath:  wf.PlanPath,
 	}
 }

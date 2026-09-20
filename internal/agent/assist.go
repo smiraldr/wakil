@@ -18,7 +18,7 @@ func (a *App) assistCanAct(forceFinish bool) bool {
 	if forceFinish {
 		return false
 	}
-	return a.AssistEnabled && a.Assist != nil
+	return a.AssistEnabledLocked() && a.Assist != nil
 }
 
 // tryAssist queries /v1/assist and, if the server returns an action that
@@ -78,7 +78,7 @@ func (a *App) tryAssist(ctx context.Context) (proxy.Message, bool) {
 	// one-line prompt and wait for y/n. This uses a DEDICATED gate that
 	// always asks — it is NOT bypassed by /auto or session grants (C2:
 	// "show the proposal in the TUI as a one-line prompt and wait for y/n").
-	if !a.AssistAuto {
+	if !a.AssistAutoLocked() {
 		approved := a.assistConfirm(action.Name, action.Args, resp.GateProbability, resp.CandidateProvenance)
 		if !approved {
 			// User declined — emit event and call the main model.
@@ -109,7 +109,7 @@ func (a *App) tryAssist(ctx context.Context) (proxy.Message, bool) {
 	// Emit the assist_event with the decision. The tool_call and tool_result
 	// events are emitted by the normal dispatch path in streamTurn.
 	decision := "took"
-	if a.AssistAuto {
+	if a.AssistAutoLocked() {
 		decision = "auto"
 	}
 	a.emitAssistEvent(decision, action, resp, "", "")

@@ -440,14 +440,20 @@ func HandleTUICommand(line string, app *App) (handled, quit bool, cmd Cmd) {
 			if fields[1] != "auto" {
 				return true, false, note("usage: /assist | /assist auto")
 			}
+			app.stateMu.Lock()
 			app.AssistAuto = !app.AssistAuto
-			if app.AssistAuto {
+			auto := app.AssistAuto
+			app.stateMu.Unlock()
+			if auto {
 				return true, false, note("assist auto: ON — proposals executed without prompting")
 			}
 			return true, false, note("assist auto: OFF — proposals require y/n confirmation")
 		}
+		app.stateMu.Lock()
 		app.AssistEnabled = !app.AssistEnabled
-		if app.AssistEnabled {
+		enabled := app.AssistEnabled
+		app.stateMu.Unlock()
+		if enabled {
 			return true, false, note("assist: ON — querying /v1/assist before tool decisions")
 		}
 		return true, false, note("assist: OFF — main model only")
