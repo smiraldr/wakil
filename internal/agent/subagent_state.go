@@ -70,6 +70,12 @@ type subagentState struct {
 	confinementTripped  bool
 	confinementPathsHit []string
 
+	// skillSuggest tracks per-turn successful tool-call sequences for the
+	// B1/B2 skill suggestion hints (skill_suggestion.go). Turn-goroutine
+	// only — written in finalizeToolResult and prepareTurn, never
+	// concurrently. Nil until the first hint check.
+	skillSuggest *skillSuggestionState
+
 	// pinUserMessage marks the user message appended by Send as Pinned, so it
 	// survives compaction and hard-max dropping. Set by dispatchSubagent for
 	// the subagent's task instruction — the subagent must never forget its own
