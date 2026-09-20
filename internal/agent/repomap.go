@@ -21,12 +21,13 @@ package agent
 //     at 500 directory listings. Preamble injection uses a 5s timeout;
 //     the /repomap command uses a longer 30s timeout for manual rebuilds.
 //
-// Design decision: directory-tree outline, NOT symbol-level. Symbol-level
-// indexing (via LSP lsp_symbols) is too slow for a 50k-LOC repo on first
-// turn (LSP server needs to index first). The file-tree outline gives the
-// agent enough to know "where things are" without LSP. The agent can use
-// lsp_symbols for symbol-level detail once it knows which directory to
-// look in.
+// Design decision: directory-tree outline for v1. Symbol-level indexing
+// was originally proposed but cut for assumed speed. A spike test
+// (spike_document_symbol_test.go) showed gopls cold-index at 353ms on the
+// wakil repo — the "too slow" assumption was wrong for Go. Symbol-level
+// enrichment is now available via /repomap --symbols (see symbolmap.go).
+// The file-tree outline remains the default for broad coverage across
+// languages without LSP dependency.
 
 import (
 	"context"

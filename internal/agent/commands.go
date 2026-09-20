@@ -1196,9 +1196,16 @@ func HandleTUICommand(line string, app *App) (handled, quit bool, cmd Cmd) {
 
 	case "/repomap":
 		// /repomap rebuilds the repo map (lightweight file-tree outline)
-		// and shows a preview. The full outline is spilled to cache for
-		// read_file access.
+		// and shows a preview. Use /repomap --symbols for a symbol-level map.
+		wantSymbols := len(fields) > 1 && fields[1] == "--symbols"
 		return true, false, func() Msg {
+			if wantSymbols {
+				summary, err := handleSymbolMapCommand(context.Background(), app)
+				if err != nil {
+					return SysNoteMsg{Text: "/repomap --symbols: " + err.Error()}
+				}
+				return SysNoteMsg{Text: summary}
+			}
 			summary, err := handleRepoMapCommand(context.Background(), app)
 			if err != nil {
 				return SysNoteMsg{Text: "/repomap: " + err.Error()}
@@ -1534,6 +1541,7 @@ const helpTextTUI = `/new, /reset         fresh conversation (new chat_id, clear
 /init                detect project conventions and create AGENTS.md if absent
 /review [ref]        review current diff (or diff vs ref) for correctness, tests, security, style
 /repomap            rebuild and show the repo map (lightweight file-tree outline)
+/repomap --symbols  rebuild and show a symbol-level map via LSP (Go-only, requires lsp_enabled)
 /help                this help
 /rewind              list checkpoints (turn-level file snapshots)
 /rewind <N>          rewind N checkpoints (1 = last turn; restores files, truncates history)

@@ -723,25 +723,97 @@ func (s *Server) Call(ctx context.Context, method string, params any) (json.RawM
 	return conn.call(ctx, method, params)
 }
 
+// capabilityBool checks if an `any` capability field is truthy.
+// LSP capability fields can be: bool, options object, or nil/absent.
+// A decoded `false` must NOT count as supported (Mashūra #20 fix).
+func capabilityBool(v any) bool {
+	if v == nil {
+		return false
+	}
+	if b, ok := v.(bool); ok {
+		return b
+	}
+	// Options object (e.g. DocumentSymbolOptions) means supported.
+	return true
+}
+
 // CapabilitySupported checks if the server advertises a given capability.
 func (s *Server) CapabilitySupported(capName string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch capName {
 	case "definitionProvider":
-		return s.caps.DefinitionProvider != nil
+		return capabilityBool(s.caps.DefinitionProvider)
 	case "referencesProvider":
-		return s.caps.ReferencesProvider != nil
+		return capabilityBool(s.caps.ReferencesProvider)
 	case "hoverProvider":
-		return s.caps.HoverProvider != nil
+		return capabilityBool(s.caps.HoverProvider)
 	case "documentSymbolProvider":
-		return s.caps.DocumentSymbolProvider != nil
+		return capabilityBool(s.caps.DocumentSymbolProvider)
 	case "workspaceSymbolProvider":
-		return s.caps.WorkspaceSymbolProvider != nil
+		return capabilityBool(s.caps.WorkspaceSymbolProvider)
 	case "renameProvider":
-		return s.caps.RenameProvider != nil
+		return capabilityBool(s.caps.RenameProvider)
 	}
 	return false
+}
+
+// DocumentSymbol returns the hierarchical symbols for a single file. This is
+// the primitive for building a symbol map: call it per file, collect the
+// results, and rank/prioritize for the outline.
+//
+// The file is opened (didOpen) only if not already tracked by the server,
+// ensuring current content without redundant opens. Returns hierarchical
+// DocumentSymbol[] (preferred) or flat SymbolInformation[] (legacy servers).
+//
+// This is a typed API for internal use (symbol map builder), NOT a tool handler.
+// Tool handlers use HandleLSPReadOnly which returns rendered strings.
+func (m *Manager) DocumentSymbol(ctx context.Context, lang, hostPath string) ([]DocumentSymbol, []SymbolInformation, error) {
+	srv, err := m.EnsureServer(ctx, lang)
+	if err != nil {
+		return nil, nil, fmt.Errorf("ensure server for %q: %w", lang, err)
+	}
+
+	if !srv.CapabilitySupported("documentSymbolProvider") {
+		return nil, nil, fmt.Errorf("server %q does not support documentSymbol", lang)
+	}
+
+	// Translate host path to container URI.
+	uri, err := m.exec.HostPathToURI(hostPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("URI translation for %q: %w", hostPath, err)
+	}
+
+	// Open the file only if not already tracked. gopls serves workspace files
+	// without didOpen, but some servers need it for reliable results.
+	srv.mu.Lock()
+	alreadyOpen := srv.docs[uri] > 0
+	srv.mu.Unlock()
+	if !alreadyOpen {
+		content, err := m.exec.ReadFile(ctx, hostPath)
+		if err != nil {
+			return nil, nil, fmt.Errorf("read file %q: %w", hostPath, err)
+		}
+		if err := srv.DidOpen(ctx, uri, lang, content); err != nil {
+			// Don't abort — gopls serves workspace files even without didOpen.
+			_ = err
+		}
+	}
+
+	params := DocumentSymbolParams{
+		TextDocument: TextDocumentIdentifier{URI: uri},
+	}
+	raw, err := srv.Call(ctx, "textDocument/documentSymbol", params)
+	if err != nil {
+		return nil, nil, fmt.Errorf("documentSymbol call for %q: %w", hostPath, err)
+	}
+
+	docSyms, symInfos, err := DecodeDocumentSymbol(raw)
+	if err != nil {
+		return nil, nil, fmt.Errorf("decode documentSymbol for %q: %w", hostPath, err)
+	}
+
+	return docSyms, symInfos, nil
 }
 
 // Shutdown gracefully stops all servers.
