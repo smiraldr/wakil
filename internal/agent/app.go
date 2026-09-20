@@ -2358,6 +2358,8 @@ func (a *App) ExecuteToolCall(ctx context.Context, tc proxy.ToolCall) toolResult
 		return stringToToolResult(a.handleReadFileFull(ctx, tc))
 	case "list_dir":
 		return stringToToolResult(a.handleListDir(ctx, tc))
+	case "math_eval":
+		return stringToToolResult(a.handleMathEval(ctx, tc))
 	case "find_files":
 		return stringToToolResult(a.handleFindFiles(ctx, tc))
 	case "search_files":

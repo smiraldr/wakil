@@ -202,12 +202,28 @@ func DefaultTools(cwd string) []proxy.Tool {
 			}, "id"),
 		}},
 	}
+	// math_eval: pure Go arithmetic evaluator, all tiers, not gated.
+	tools = append(tools, mathEvalToolDef())
 	// Staging, memory, and skill tools are appended to every tier.
 	// Staging is ungated by design; memory and skill tier-gating is at dispatch time.
 	tools = append(append(append(tools, StagingTools()...), MemoryTools()...), SkillTools()...)
 	// Structured read-only git tools: parent + discovery tiers.
 	tools = append(tools, GitTools()...)
 	return tools
+}
+
+// mathEvalToolDef returns the math_eval tool definition. Shared across all tiers.
+func mathEvalToolDef() proxy.Tool {
+	return proxy.Tool{Type: "function", Function: proxy.ToolFunction{
+		Name:        "math_eval",
+		Description: "Evaluate a mathematical expression and return the result. " +
+			"Supports + - * / % ^, parentheses, and functions: sqrt, pow, abs, floor, ceil, min, max. " +
+			"Constants: pi, e. No variables or assignment. Max 256 characters, max 10 nesting levels. " +
+			"Runs in-process — no shell, no side effects.",
+		Parameters: SchemaObj(map[string]interface{}{
+			"expression": StrProp("Mathematical expression to evaluate (e.g. '2 + 3 * 4', 'sqrt(144)', 'pow(2, 10)')."),
+		}, "expression"),
+	}}
 }
 
 // GatedTool reports whether a tool requires human confirmation before running.
@@ -289,6 +305,8 @@ func DiscoveryTools(cwd string) []proxy.Tool {
 			}),
 		}},
 	}
+	// math_eval: pure Go arithmetic evaluator, all tiers, not gated.
+	tools = append(tools, mathEvalToolDef())
 	// Staging, memory, and skill tools are appended to every tier.
 	tools = append(append(append(tools, StagingTools()...), MemoryTools()...), SkillTools()...)
 	// Structured read-only git tools: discovery subagents get
@@ -443,6 +461,8 @@ func EditTools(cwd string) []proxy.Tool {
 			}, "src", "dst"),
 		}},
 	}
+	// math_eval: pure Go arithmetic evaluator, all tiers, not gated.
+	tools = append(tools, mathEvalToolDef())
 	// Staging, memory, and skill tools are appended to every tier.
 	return append(append(append(tools, StagingTools()...), MemoryTools()...), SkillTools()...)
 }
