@@ -236,13 +236,20 @@ func (a *App) runShellWithDeadline(ctx context.Context, command string, readActi
 	defer timer.Stop()
 	select {
 	case <-done:
-		// Process finished within the deadline — read the full log.
-		// notifyOnExit stays false: the reaper will NOT push a completion
-		// notice, so the model sees exactly one result (this one).
-		out, readErr := a.Exec.ReadFile(ctx, logPath)
+		// Process finished within the deadline — read the TAIL of the log,
+		// bounded (H4): a chatty command can no longer pull gigabytes into
+		// agent memory. Tail semantics preserve the exit marker (end-anchored)
+		// and the most diagnostic output. ParseExitMarker runs on the RAW
+		// tail BEFORE any truncation note is appended (end-anchored regex).
+		const logTailCap = 1 << 20 // 1 MB
+		out, readErr := a.Exec.ReadFileTail(ctx, logPath, logTailCap)
 		if readErr != nil {
 			out = "(output unreadable: " + readErr.Error() + ")"
 		}
+		// H4: capture the RAW length BEFORE ParseExitMarker strips the marker
+		// line — a capped tail shrinks below the cap after stripping, so the
+		// omission check must run on the raw read.
+		rawLen := int64(len(out))
 		// Exit-code recovery (follow-up): the wrapper wrote a
 		// sentinel marker; parse it and surface non-zero exits as ERROR so a
 		// failing backgrounded command can never masquerade as "(no output)".
@@ -261,6 +268,13 @@ func (a *App) runShellWithDeadline(ctx context.Context, command string, readActi
 			}
 		} else {
 			runErr = fmt.Errorf("exit code unknown (completion marker missing — killed, shell syntax error, or marker displaced)")
+		}
+		// H4: if the raw tail hit the cap, earlier output was discarded — say
+		// so AFTER marker parsing (the note must not break end-anchoring).
+		// The full log remains on disk at logPath for shell-level access.
+		if readErr == nil && rawLen >= logTailCap {
+			out = "[... earlier output omitted (log tail cap " +
+				fmt.Sprintf("%d", logTailCap) + " bytes; full log: " + logPath + " ...) ]\n" + out
 		}
 		// LSP file-sync for non-read-only commands that modify files. Marking
 		// happens regardless of exit code: a command that ran but exited
@@ -715,10 +729,12 @@ func (a *App) handleReadFile(ctx context.Context, tc proxy.ToolCall) string {
 		if sizeLimit <= 0 {
 			sizeLimit = 1 << 20
 		}
+		// H4: the cap applies even when a limit window is requested — a
+		// range read of a huge spill file loads at most sizeLimit bytes.
 		if args.Limit != 0 {
-			sizeLimit = 0 // caller explicitly bounded the read; skip the guard, same as the executor path below
+			sizeLimit = 0 // caller explicitly bounded the window; skip the pre-read refusal…
 		}
-		out, errResult := hostCacheReadResult(args.Path, sizeLimit, "read", "specify a line/byte range or use search_files.")
+		out, errResult := hostCacheReadResult(args.Path, sizeLimit, 0, "read", "specify a line/byte range or use search_files.")
 		if errResult != "" {
 			return errResult
 		}
@@ -730,9 +746,11 @@ func (a *App) handleReadFile(ctx context.Context, tc proxy.ToolCall) string {
 		return "ERROR: " + err.Error()
 	}
 	// Guard 1a: stat before reading — refuse oversized unbounded reads without
-	// loading the file. Skip when a Limit is already set: the caller explicitly
-	// bounded the read, so the size guard's advice ("specify a range") has been
-	// taken and the refusal would be a dead end.
+	// loading the file. When the caller explicitly bounded the read with a
+	// positive Limit the refusal would be a dead end ("specify a range" —
+	// already done), so the guard is skipped — but the load is still CAPPED:
+	// ReadFileBounded limits host-side allocation to sizeLimit bytes even for
+	// a window into a 4 GB file (H4). Negative limits never skip the guard.
 	sizeLimit := int64(a.Cfg.ReadFileSizeLimit)
 	if sizeLimit <= 0 {
 		sizeLimit = 1 << 20 // 1 MB safety net when config is zero
@@ -744,16 +762,13 @@ func (a *App) handleReadFile(ctx context.Context, tc proxy.ToolCall) string {
 				float64(fileSize)/(1<<20), float64(sizeLimit)/(1<<20))
 		}
 	}
-	out, err := a.Exec.ReadFile(ctx, canonical)
-	// Redirect a directory read to the right tool instead of returning a raw
-	// errno the model tends to retry against (a known subagent loop trigger).
+	out, truncated, err := a.Exec.ReadFileBounded(ctx, canonical, sizeLimit)
 	if err != nil && strings.Contains(strings.ToLower(err.Error()), "is a directory") {
 		return fmt.Sprintf("ERROR: %q is a directory, not a file — use list_dir to see its contents or search_files to search within it.", args.Path)
 	}
 	if err != nil {
 		return formatResult(out, err)
 	}
-	// Guard 1b: refuse binary content detected via null-byte sniff.
 	if strings.ContainsRune(out, 0) {
 		return fmt.Sprintf(
 			"ERROR: binary file, %.2f MB — not readable as text.",
@@ -764,9 +779,16 @@ func (a *App) handleReadFile(ctx context.Context, tc proxy.ToolCall) string {
 	// avg/max line length and known VCS/dependency path components. It
 	// never refuses — the model can override with limit or read_file_full.
 	if args.Limit == 0 && isLikelyNoisy(canonical, out) {
-		return filePreview(out)
+		out = filePreview(out)
+	} else {
+		out = formatFileView(out, args.Offset, args.Limit)
 	}
-	return formatFileView(out, args.Offset, args.Limit)
+	// H4: append the truncation note AFTER formatting — appending before
+	// would let the limit window slice it off or number it as file content.
+	if truncated {
+		out += fmt.Sprintf("\n[... file truncated at %d bytes for this view — later content not loaded; a larger offset may be beyond the loaded region — use run_shell (e.g. sed -n) for precise ranges ...]", sizeLimit)
+	}
+	return out
 }
 
 // handleReadFileFull reads a full file with a higher size ceiling, spill-path
@@ -787,7 +809,7 @@ func (a *App) handleReadFileFull(ctx context.Context, tc proxy.ToolCall) string 
 		if fullLimit <= 0 {
 			fullLimit = 256 << 10
 		}
-		out, errResult := hostCacheReadResult(args.Path, fullLimit, "full-read", "use read_file with an offset/limit range instead.")
+		out, errResult := hostCacheReadResult(args.Path, fullLimit, fullLimit, "full-read", "use read_file with an offset/limit range instead.")
 		if errResult != "" {
 			return errResult
 		}
@@ -810,7 +832,7 @@ func (a *App) handleReadFileFull(ctx context.Context, tc proxy.ToolCall) string 
 			"ERROR: file is %.2f MB, exceeds full-read limit of %.2f MB — use read_file with an offset/limit range instead.",
 			float64(fileSize)/(1<<20), float64(fullLimit)/(1<<20))
 	}
-	out, err := a.Exec.ReadFile(ctx, canonical)
+	out, truncated, err := a.Exec.ReadFileBounded(ctx, canonical, fullLimit)
 	// Redirect a directory read to the right tool (same as read_file).
 	if err != nil && strings.Contains(strings.ToLower(err.Error()), "is a directory") {
 		return fmt.Sprintf("ERROR: %q is a directory, not a file — use list_dir to see its contents or search_files to search within it.", args.Path)
@@ -833,7 +855,13 @@ func (a *App) handleReadFileFull(ctx context.Context, tc proxy.ToolCall) string 
 			"ERROR: file is %.2f MB, exceeds full-read limit of %.2f MB — use read_file with an offset/limit range instead.",
 			float64(len(out))/(1<<20), float64(fullLimit)/(1<<20))
 	}
-	return formatFileView(out, 0, 0)
+	view := formatFileView(out, 0, 0)
+	// H4: truncation note appended AFTER formatting so it can't be windowed
+	// away or numbered as file content.
+	if truncated {
+		view += fmt.Sprintf("\n[... truncated at %d bytes (full-read limit) — later content not loaded ...]", fullLimit)
+	}
+	return view
 }
 
 // handleListDir lists directory contents after path confinement.

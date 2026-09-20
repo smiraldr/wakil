@@ -54,6 +54,9 @@ func (f *fakeLSPExec) IsProcessGroupAlive(_ context.Context, _ int) bool { retur
 func (f *fakeLSPExec) ReadFileTail(_ context.Context, _ string, _ int64) (string, error) {
 	return "", nil
 }
+func (f *fakeLSPExec) ReadFileBounded(_ context.Context, _ string, _ int64) (string, bool, error) {
+	return "", false, nil
+}
 func (f *fakeLSPExec) StatFile(_ context.Context, p string) (int64, error) {
 	if v, ok := f.files[p]; ok {
 		return int64(len(v)), nil

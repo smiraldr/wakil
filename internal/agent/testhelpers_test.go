@@ -146,7 +146,28 @@ func (f *fakeExecutor) KillPgid(_ context.Context, pgid, sig int) error      { r
 func (f *fakeExecutor) IsProcessAlive(_ context.Context, pid int) bool       { return false }
 func (f *fakeExecutor) IsProcessGroupAlive(_ context.Context, pgid int) bool { return false }
 func (f *fakeExecutor) ReadFileTail(_ context.Context, path string, maxBytes int64) (string, error) {
-	return "", nil
+	// Serve the same content as ReadFile (H4: the done-path reads logs via
+	// ReadFileTail), tail-clamped like the real executors.
+	full, err := f.ReadFile(context.Background(), path)
+	if err != nil {
+		return "", err
+	}
+	if int64(len(full)) > maxBytes {
+		full = full[int64(len(full))-maxBytes:]
+	}
+	return full, nil
+}
+func (f *fakeExecutor) ReadFileBounded(_ context.Context, p string, maxBytes int64) (string, bool, error) {
+	// Same semantics as ReadFile but bounded to maxBytes bytes, mirroring the
+	// real executors (H4).
+	full, err := f.ReadFile(context.Background(), p)
+	if err != nil {
+		return "", false, err
+	}
+	if int64(len(full)) <= maxBytes {
+		return full, false, nil
+	}
+	return full[:maxBytes], true, nil
 }
 func (f *fakeExecutor) StartInteractive(_ context.Context, command string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, int, error) {
 	return nil, nil, nil, 0, fmt.Errorf("not implemented in fake executor")

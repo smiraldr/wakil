@@ -2646,12 +2646,15 @@ func formatResult(out string, err error) string {
 // success, or ("", errorResult) when the read should be refused/failed —
 // callers pass errorResult straight back as the tool result.
 //
-// sizeLimit <= 0 disables the pre-read size guard (mirrors the read_file
-// behavior when an explicit Limit/offset already bounds the read).
-// adviceSuffix is appended to the size-guard error message so read_file and
-// read_file_full keep their existing distinct wording ("specify a line/byte
-// range..." vs "use read_file with an offset/limit range instead.").
-func hostCacheReadResult(path string, sizeLimit int64, kind, adviceSuffix string) (content, errorResult string) {
+// sizeLimit > 0: pre-read size guard refuses files over the limit (with
+// adviceSuffix guidance) before loading. sizeLimit <= 0: the guard is skipped
+// (caller requested a window) but the load itself is still HARD-CAPPED at
+// hardCap bytes (H4: bounded host-side allocation regardless of file size).
+// Truncation is NOT signalled in the content — callers that need to surface
+// it should compare loaded length to the cap they passed. adviceSuffix is
+// appended to the size-guard error message so read_file and read_file_full
+// keep their existing distinct wording.
+func hostCacheReadResult(path string, sizeLimit, hardCap int64, kind, adviceSuffix string) (content, errorResult string) {
 	if sizeLimit > 0 {
 		if fileSize, serr := wtools.StatHostCacheFile(path); serr == nil && fileSize > sizeLimit {
 			return "", fmt.Sprintf(
@@ -2659,13 +2662,24 @@ func hostCacheReadResult(path string, sizeLimit int64, kind, adviceSuffix string
 				float64(fileSize)/(1<<20), kind, float64(sizeLimit)/(1<<20), adviceSuffix)
 		}
 	}
-	out, err := wtools.ReadHostCacheFile(path)
+	cap := hardCap
+	if cap <= 0 {
+		cap = sizeLimit
+	}
+	if cap <= 0 {
+		cap = 1 << 20
+	}
+	out, truncated, err := wtools.ReadHostCacheFileBounded(path, cap)
 	if err != nil {
 		return "", formatResult(out, err)
 	}
 	if strings.ContainsRune(out, 0) {
 		return "", fmt.Sprintf("ERROR: binary file, %.2f MB — not readable as text.", float64(len(out))/(1<<20))
 	}
+	// H4: the truncation note is appended by the CALLER after formatting
+	// (windowing could otherwise slice it off or number it as content), so
+	// truncated content is returned with the flag, not an embedded note.
+	_ = truncated
 	return out, ""
 }
 

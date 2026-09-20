@@ -322,6 +322,9 @@ func (e *erroringExecutor) IsProcessGroupAlive(ctx context.Context, pgid int) bo
 func (e *erroringExecutor) ReadFileTail(ctx context.Context, p string, m int64) (string, error) {
 	return e.base.ReadFileTail(ctx, p, m)
 }
+func (e *erroringExecutor) ReadFileBounded(ctx context.Context, p string, m int64) (string, bool, error) {
+	return e.base.ReadFileBounded(ctx, p, m)
+}
 func (e *erroringExecutor) StartInteractive(ctx context.Context, cmd string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, int, error) {
 	return e.base.StartInteractive(ctx, cmd)
 }

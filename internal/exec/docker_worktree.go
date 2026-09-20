@@ -52,8 +52,12 @@ func NewDockerWorktreeExecutor(parent *DockerExecutor, wtRoot string) Executor {
 func (w *dockerWorktreeExecutor) RunShell(ctx context.Context, command string) (string, error) {
 	cmd := osexec.CommandContext(ctx, "docker", "exec", w.container, "sh", "-c",
 		runFromRoot(w.wtRoot, command))
-	out, err := cmd.CombinedOutput()
-	return strings.TrimRight(string(out), "\r\n"), err
+	// H4: bounded capture, same as the parent executor (inherits its cap).
+	out, omitted, err := runShellCapped(cmd, capOr(w.ShellOutputCap))
+	if omitted > 0 {
+		out = fmt.Sprintf("[... first %d bytes of output omitted (showing last %d) ...]\n", omitted, len(out)) + out
+	}
+	return strings.TrimRight(out, "\r\n"), err
 }
 
 // Cwd returns the worktree root.
@@ -162,6 +166,26 @@ func (w *dockerWorktreeExecutor) ReadFileTail(ctx context.Context, path string, 
 		return "", fmt.Errorf("reading log: %s", strings.TrimSpace(out))
 	}
 	return out, nil
+}
+
+// ReadFileBounded reads at most maxBytes bytes from the start of a file in
+// the worktree. Container-side head -c bounds the transfer; the returned
+// string is additionally clamped host-side, so allocation stays ≤ maxBytes+1
+// even if the container's head misbehaves.
+func (w *dockerWorktreeExecutor) ReadFileBounded(ctx context.Context, path string, maxBytes int64) (string, bool, error) {
+	if maxBytes <= 0 {
+		return "", false, fmt.Errorf("ReadFileBounded: maxBytes must be > 0, got %d", maxBytes)
+	}
+	out, err := w.execCtx(ctx, false, "sh", "-c",
+		fmt.Sprintf("cd %s && head -c %d -- \"$1\"", shQuote(w.wtRoot), maxBytes+1), "sh", path)
+	if err != nil {
+		return "", false, fmt.Errorf("%s", strings.TrimSpace(out))
+	}
+	truncated := int64(len(out)) > maxBytes
+	if truncated {
+		out = truncateInvalidUTF8Suffix(out[:maxBytes])
+	}
+	return out, truncated, nil
 }
 
 // HostPathToURI returns an error — a container /tmp worktree has no host-side

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 )
 
 // ExtractSpillPath returns the disk path embedded by CapToolResult,
@@ -160,6 +161,19 @@ func IsToolCacheHostPath(path string) bool {
 	return p == root || strings.HasPrefix(p, root+string(filepath.Separator))
 }
 
+// truncateInvalidUTF8Suffix drops an incomplete trailing rune (up to 3 bytes)
+// so a byte-capped cut doesn't emit a broken sequence.
+func truncateInvalidUTF8Suffix(s string) string {
+	for i := 0; i < 3 && len(s) > 0; i++ {
+		r, size := utf8.DecodeLastRuneInString(s)
+		if r != utf8.RuneError || size > 1 {
+			return s
+		}
+		s = s[:len(s)-1]
+	}
+	return s
+}
+
 // ErrHostCacheEscape is returned (wrapped, match with errors.Is) when a path
 // resolves OUTSIDE the toolcache root — a traversal or symlink escape. It is
 // distinct from ordinary filesystem errors so callers can surface it as a
@@ -296,6 +310,42 @@ func ReadHostCacheFile(path string) (string, error) {
 		return "", err
 	}
 	return string(b), nil
+}
+
+// ReadHostCacheFileBounded reads at most maxBytes bytes from the start of a
+// toolcache spill file (H4: bounded host-side allocation regardless of file
+// size). Truncated reports whether content continued past the cap. Same
+// confinement as ReadHostCacheFile.
+func ReadHostCacheFileBounded(path string, maxBytes int64) (string, bool, error) {
+	if maxBytes <= 0 {
+		return "", false, fmt.Errorf("ReadHostCacheFileBounded: maxBytes must be > 0, got %d", maxBytes)
+	}
+	if maxBytes > 64<<20 {
+		return "", false, fmt.Errorf("ReadHostCacheFileBounded: maxBytes %d exceeds sane cap (64 MB)", maxBytes)
+	}
+	r, rel, fi, err := resolveHostCachePath(path)
+	if err != nil {
+		return "", false, err
+	}
+	defer r.Close()
+	if !fi.Mode().IsRegular() {
+		return "", false, fmt.Errorf("%w: %s", ErrHostCacheNotRegular, path)
+	}
+	f, err := r.Open(rel)
+	if err != nil {
+		return "", false, err
+	}
+	defer f.Close()
+	buf := make([]byte, maxBytes+1)
+	n, rerr := io.ReadFull(f, buf)
+	if rerr != nil && rerr != io.ErrUnexpectedEOF && rerr != io.EOF {
+		return "", false, rerr
+	}
+	truncated := int64(n) > maxBytes
+	content := string(buf[:min(int64(n), maxBytes)])
+	// UTF-8-safe cut, consistent with the executor ReadFileBounded variants.
+	content = truncateInvalidUTF8Suffix(content)
+	return content, truncated, nil
 }
 
 // StatHostCacheFile returns the byte size of a toolcache spill file directly

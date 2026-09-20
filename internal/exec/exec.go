@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/treeol/wakil/internal/safe"
 )
@@ -32,6 +33,11 @@ import (
 // DockerExecutor wraps its shell-level "No such file or directory" / "No such
 // container" errors with this sentinel.
 var ErrFileNotFound = errors.New("file not found")
+
+// DefaultShellOutputCap bounds how much of a shell command's combined output
+// RunShell retains in host memory (H4). Generous default; per-executor
+// override via ShellOutputCap.
+const DefaultShellOutputCap = 1 << 20 // 1 MB
 
 // Executor abstracts where tool_calls actually run. Commands always execute
 // from the workspace root; in-command directory changes (cd sub && …) affect
@@ -111,6 +117,12 @@ type Executor interface {
 	// ReadFileTail returns the last maxBytes of path; enforces the cap internally.
 	// maxBytes must be > 0; callers passing zero or negative get an error.
 	ReadFileTail(ctx context.Context, path string, maxBytes int64) (string, error)
+	// ReadFileBounded reads AT MOST maxBytes bytes from the START of the file,
+	// returning content plus a truncation flag. Unlike ReadFile it bounds
+	// host-side allocation by maxBytes regardless of file size — the guard
+	// for reads where the size is unknown or the caller may be windowing a
+	// huge file. maxBytes must be > 0.
+	ReadFileBounded(ctx context.Context, path string, maxBytes int64) (string, bool, error)
 	// StatFile returns the byte size of the file at path without reading it.
 	// Returns an error if the path does not exist or is not accessible.
 	StatFile(ctx context.Context, path string) (int64, error)
@@ -177,7 +189,10 @@ type DockerExecutor struct {
 	// kvr staging store
 	stagingMount string // host path of the staging mount; empty = no kvr
 	kvrSocket    string // host-side path to the kvr UDS socket; empty if unavailable
-	kvrAvailable bool   // kvr started and PING succeeded
+	// ShellOutputCap bounds RunShell's retained combined output in host
+	// memory (H4); <= 0 means DefaultShellOutputCap.
+	ShellOutputCap int64
+	kvrAvailable   bool // kvr started and PING succeeded
 	// cdpPort is the host-side port published for chromium's CDP endpoint,
 	// or 0 if not published.
 	cdpPort int
@@ -1045,8 +1060,24 @@ func (d *DockerExecutor) execCtx(ctx context.Context, interactive bool, args ...
 
 func (d *DockerExecutor) RunShell(ctx context.Context, command string) (string, error) {
 	cmd := exec.CommandContext(ctx, "docker", "exec", d.container, "sh", "-c", runFromRoot(d.workspaceRoot, command))
-	out, err := cmd.CombinedOutput()
-	return strings.TrimRight(string(out), "\r\n"), err
+	// H4: host-side bounded capture — a chatty command can no longer buffer
+	// unbounded output in agent memory. Tail-keeping: the last ShellCap bytes
+	// are retained; the child always drains (no pipe deadlock); exit error
+	// semantics unchanged. ErrWaitDelay (grandchild outliving the leader)
+	// surfaces as success with the captured tail — the command itself exited.
+	out, omitted, err := runShellCapped(cmd, capOr(d.ShellOutputCap))
+	if omitted > 0 {
+		out = fmt.Sprintf("[... first %d bytes of output omitted (showing last %d) ...]\n", omitted, len(out)) + out
+	}
+	return strings.TrimRight(out, "\r\n"), err
+}
+
+// capOr returns v if positive, else the default shell output cap.
+func capOr(v int64) int64 {
+	if v > 0 {
+		return v
+	}
+	return DefaultShellOutputCap
 }
 
 func (d *DockerExecutor) ReadFile(ctx context.Context, path string) (string, error) {
@@ -1060,6 +1091,32 @@ func (d *DockerExecutor) ReadFile(ctx context.Context, path string) (string, err
 		return "", fmt.Errorf("%s", msg)
 	}
 	return out, nil
+}
+
+// ReadFileBounded reads at most maxBytes bytes from the start of the file.
+// The cap is enforced on the HOST side of the pipe (bounded buffer), not just
+// in the container: the container `head -c` is an optimization; even if the
+// container ignored it, host-side capture cannot exceed the cap. Error
+// semantics mirror ReadFile (isShellNotFound → ErrFileNotFound; directory
+// reads surface "Is a directory").
+func (d *DockerExecutor) ReadFileBounded(ctx context.Context, path string, maxBytes int64) (string, bool, error) {
+	if maxBytes <= 0 {
+		return "", false, fmt.Errorf("ReadFileBounded: maxBytes must be > 0, got %d", maxBytes)
+	}
+	out, err := d.execCtx(ctx, false, "sh", "-c",
+		fmt.Sprintf("cd %s && head -c %d -- \"$1\"", shQuote(d.workspaceRoot), maxBytes+1), "sh", path)
+	if err != nil {
+		msg := strings.TrimSpace(out)
+		if isShellNotFound(msg) {
+			return "", false, fmt.Errorf("%w: %s", ErrFileNotFound, path)
+		}
+		return "", false, fmt.Errorf("%s", msg)
+	}
+	truncated := int64(len(out)) > maxBytes
+	if truncated {
+		out = truncateInvalidUTF8Suffix(out[:maxBytes])
+	}
+	return out, truncated, nil
 }
 
 func (d *DockerExecutor) StatFile(ctx context.Context, path string) (int64, error) {
@@ -1255,6 +1312,9 @@ type DirectExecutor struct {
 	sandboxTools string
 	toolsOnce    sync.Once // guards the probe: executor is shared with concurrent subagents
 	generation   int
+	// ShellOutputCap bounds RunShell's retained combined output in host
+	// memory (H4); <= 0 means DefaultShellOutputCap.
+	ShellOutputCap int64
 }
 
 func NewDirectExecutor(workdir string) (*DirectExecutor, error) {
@@ -1277,8 +1337,12 @@ func NewDirectExecutor(workdir string) (*DirectExecutor, error) {
 
 func (e *DirectExecutor) RunShell(ctx context.Context, command string) (string, error) {
 	cmd := exec.CommandContext(ctx, "sh", "-c", runFromRoot(e.root, command))
-	out, err := cmd.CombinedOutput()
-	return strings.TrimRight(string(out), "\r\n"), err
+	// H4: host-side bounded capture (tail-keeping) — see DockerExecutor.RunShell.
+	out, omitted, err := runShellCapped(cmd, capOr(e.ShellOutputCap))
+	if omitted > 0 {
+		out = fmt.Sprintf("[... first %d bytes of output omitted (showing last %d) ...]\n", omitted, len(out)) + out
+	}
+	return strings.TrimRight(out, "\r\n"), err
 }
 
 func (e *DirectExecutor) resolve(path string) string {
@@ -1308,6 +1372,47 @@ func (e *DirectExecutor) ReadFile(_ context.Context, path string) (string, error
 		return "", err
 	}
 	return string(b), nil
+}
+
+// ReadFileBounded reads at most maxBytes bytes from the start of the file.
+// Allocation is bounded by maxBytes regardless of file size; truncated
+// reports whether the file continued past the cap. Error semantics mirror
+// ReadFile (ErrFileNotFound wrapping, EISDIR surfaces as "is a directory").
+func (e *DirectExecutor) ReadFileBounded(_ context.Context, path string, maxBytes int64) (string, bool, error) {
+	if maxBytes <= 0 {
+		return "", false, fmt.Errorf("ReadFileBounded: maxBytes must be > 0, got %d", maxBytes)
+	}
+	f, err := os.Open(e.resolve(path))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", false, fmt.Errorf("%w: %s", ErrFileNotFound, path)
+		}
+		return "", false, err
+	}
+	defer f.Close()
+	buf := make([]byte, maxBytes+1) // +1 to detect continuation
+	n, rerr := io.ReadFull(f, buf)
+	if rerr != nil && rerr != io.ErrUnexpectedEOF && rerr != io.EOF {
+		return "", false, rerr
+	}
+	truncated := int64(n) > maxBytes
+	content := string(buf[:min(int64(n), maxBytes)])
+	// Don't split a UTF-8 rune at the cut.
+	content = truncateInvalidUTF8Suffix(content)
+	return content, truncated, nil
+}
+
+// truncateInvalidUTF8Suffix drops an incomplete trailing rune (up to 3 bytes)
+// so a byte-capped cut doesn't emit a broken sequence.
+func truncateInvalidUTF8Suffix(s string) string {
+	for i := 0; i < 3 && len(s) > 0; i++ {
+		r, size := utf8.DecodeLastRuneInString(s)
+		if r != utf8.RuneError || size > 1 {
+			return s
+		}
+		s = s[:len(s)-1]
+	}
+	return s
 }
 
 func (e *DirectExecutor) ListDir(_ context.Context, path string) (string, error) {

@@ -26,6 +26,9 @@ type fakeExec struct{}
 
 func (fakeExec) RunShell(context.Context, string) (string, error)          { return "", nil }
 func (fakeExec) ReadFile(context.Context, string) (string, error)          { return "", nil }
+func (fakeExec) ReadFileBounded(context.Context, string, int64) (string, bool, error) {
+	return "", false, nil
+}
 func (fakeExec) ListDir(context.Context, string) (string, error)           { return "", nil }
 func (fakeExec) WriteFile(context.Context, string, string) (string, error) { return "", nil }
 func (fakeExec) WriteFileBytes(context.Context, string, []byte) (string, error) {

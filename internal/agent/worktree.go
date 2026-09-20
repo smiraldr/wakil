@@ -464,6 +464,13 @@ func diffWorktree(ctx context.Context, a *App, wtDir string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("git diff: %s", strings.TrimSpace(out))
 	}
+	// H4: RunShell output is tail-capped at ShellOutputCap. A patch that hit
+	// the cap is INCOMPLETE — applying a truncated patch would corrupt the
+	// worktree, and the omission note would corrupt it too. Fail loudly
+	// instead of truncating silently (completeness-critical caller).
+	if strings.Contains(out, "bytes of output omitted") {
+		return "", fmt.Errorf("worktree diff exceeds the shell output cap — too many/binary-large changes for snapshot-based apply; reduce the change set or commit directly in the worktree")
+	}
 	// Restore trailing newline stripped by the executor's TrimRight.
 	if out != "" && !strings.HasSuffix(out, "\n") {
 		out += "\n"

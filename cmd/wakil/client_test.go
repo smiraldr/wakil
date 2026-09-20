@@ -133,6 +133,9 @@ func (f *fakeExecutor) IsProcessGroupAlive(_ context.Context, _ int) bool { retu
 func (f *fakeExecutor) ReadFileTail(_ context.Context, path string, maxBytes int64) (string, error) {
 	return "", nil
 }
+func (f *fakeExecutor) ReadFileBounded(_ context.Context, path string, maxBytes int64) (string, bool, error) {
+	return "", false, nil
+}
 func (f *fakeExecutor) StartInteractive(_ context.Context, command string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, int, error) {
 	return nil, nil, nil, 0, fmt.Errorf("not implemented in fake executor")
 }
