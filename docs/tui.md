@@ -58,6 +58,7 @@ opens a picker to attach a file or folder for context.
 /maxctx              show current effective context cap and resulting compaction thresholds
 /init                detect project conventions and create AGENTS.md if absent
 /review [ref]        review current diff (or diff vs ref) for correctness, tests, security, style
+/skill-create <topic> research a topic via a subagent and save it as a skill (asks for confirmation)
 /repomap             rebuild and show the repo map (lightweight file-tree outline)
 /rewind              list checkpoints or rewind N turns (see Session section above)
 /info                toggle the info panel (proxy/model/exec/cwd/costs/grounding)

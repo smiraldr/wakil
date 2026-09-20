@@ -1213,6 +1213,19 @@ func HandleTUICommand(line string, app *App) (handled, quit bool, cmd Cmd) {
 			return SysNoteMsg{Text: summary}
 		}
 
+	case "/skill-create":
+		// /skill-create <topic> — research a topic via a tools-tier subagent
+		// and save the draft as a skill after explicit user confirmation.
+		// See skill_create.go for the safety model.
+		topic := strings.Join(fields[1:], " ")
+		return true, false, func() Msg {
+			report, err := handleSkillCreateCommand(context.Background(), app, topic)
+			if err != nil {
+				return SysNoteMsg{Text: "/skill-create: " + err.Error()}
+			}
+			return SysNoteMsg{Text: report}
+		}
+
 	case "/help":
 		return true, false, note(helpTextTUI)
 
@@ -1499,6 +1512,7 @@ const helpTextTUI = `/new, /reset         fresh conversation (new chat_id, clear
 /maxctx <chars>      cap effective context for large models (e.g. 200000 = ~200k chars; 0 = disabled)
 /maxctx              show current effective context cap and resulting thresholds
 /plan <task>         start a gather→plan→review→implement workflow for <task>
+/skill-create <topic> research a topic and save it as a skill (asks for confirmation)
 /plan --oracle=MODE  set per-run oracle schedule (every-step|on-deviation|phases-only)
 /plan status         show current workflow phase and step
 /plan approve        approve the plan; force-skip review (logged); advance past pauses
