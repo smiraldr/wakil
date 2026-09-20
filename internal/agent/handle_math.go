@@ -32,8 +32,8 @@ import (
 // division-by-zero → error (not panic).
 
 const (
-	mathExprMaxLen  = 256
-	mathMaxDepth    = 10
+	mathExprMaxLen   = 256
+	mathMaxDepth     = 10
 	mathNumberMaxLen = 30 // digits in a single number literal
 )
 
@@ -44,9 +44,9 @@ func (e mathError) Error() string { return e.msg }
 
 // mathParser is a recursive descent parser/evaluator for arithmetic.
 type mathParser struct {
-	s     string  // input
-	pos   int     // current position
-	depth int     // nesting depth
+	s     string // input
+	pos   int    // current position
+	depth int    // nesting depth
 }
 
 // EvalMath parses and evaluates a mathematical expression. Returns the
@@ -80,14 +80,6 @@ func (p *mathParser) skipWS() {
 	for p.pos < len(p.s) && (p.s[p.pos] == ' ' || p.s[p.pos] == '\t' || p.s[p.pos] == '\n' || p.s[p.pos] == '\r') {
 		p.pos++
 	}
-}
-
-func (p *mathParser) peek() byte {
-	p.skipWS()
-	if p.pos < len(p.s) {
-		return p.s[p.pos]
-	}
-	return 0
 }
 
 func (p *mathParser) consume(b byte) bool {

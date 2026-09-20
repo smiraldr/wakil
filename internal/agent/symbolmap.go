@@ -152,17 +152,6 @@ func BuildSymbolMap(ctx context.Context, exe fileLister, mgr *lsp.Manager, lang 
 		b.WriteString(section)
 	}
 
-	// Count dropped files more accurately.
-	renderedCount := 0
-	for i := range results {
-		section := renderFileSection(results[i].path, results[i].symbols, results[i].flat)
-		if renderedCount > 0 {
-			// Already counted — this is just for counting
-		}
-		renderedCount++
-		_ = section
-	}
-
 	outline := b.String()
 	if len(results) > 0 && b.Len() == 0 {
 		// First file was too large — include it truncated.
@@ -248,9 +237,7 @@ func discoverSourceFiles(ctx context.Context, exe fileLister, lang string) ([]st
 			if dir != "." {
 				full = filepath.Join(dir, line)
 			}
-			if strings.HasSuffix(full, "/") {
-				full = strings.TrimSuffix(full, "/")
-			}
+			full = strings.TrimSuffix(full, "/")
 			if strings.HasSuffix(line, "/") {
 				dirName := strings.TrimSuffix(line, "/")
 				if isExcludedDir(dirName) {

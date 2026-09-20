@@ -276,7 +276,7 @@ func (f *wiringFacade) Info() sessionclient.InfoSnapshot {
 	assistAuto := app.AssistAuto
 	infoPanelOpen := app.InfoPanelOpen
 	wf := app.Workflow
-	// Copy config fields needed by mashuraPanelLabel under the lock to
+	// Copy config fields needed by mashuraPanelLabelFromFields under the lock to
 	// avoid a whole-Cfg struct copy racing with stateMu-guarded Cfg
 	// field writes (SetMaxParallel, applyModelOverrideLocked). These
 	// specific fields are never written at runtime, but the struct copy
@@ -380,14 +380,9 @@ func (f *wiringFacade) Info() sessionclient.InfoSnapshot {
 	return info
 }
 
-// mashuraPanelLabel returns a short display string for the active mashura
-// panel — moved from the TUI (info_panel.go) so the info snapshot can carry
-// it without the TUI reading config internals.
-func mashuraPanelLabel(cfg config.Config) string {
-	return mashuraPanelLabelFromFields(cfg.MashuraToolPanels, cfg.MashuraPanels, cfg.OracleModel)
-}
-
-// mashuraPanelLabelFromFields is the lock-free core of mashuraPanelLabel.
+// mashuraPanelLabelFromFields returns a short display string for the active mashura
+// panel, using already-copied config fields to avoid a whole-Cfg struct copy
+// that would race with stateMu-guarded Cfg field writes.
 // Callers who have already copied the relevant config fields under stateMu
 // use this to avoid a whole-Cfg struct copy that would race with
 // stateMu-guarded Cfg field writes.
@@ -1116,10 +1111,6 @@ func toClientBackends(backends []agent.BackendInfo) []sessionclient.Backend {
 		}
 	}
 	return out
-}
-
-func toClientWorkflow(app *agent.App) *sessionclient.WorkflowSnapshot {
-	return workflowSnapshot(app.Workflow)
 }
 
 // workflowSnapshot builds a WorkflowSnapshot from a WorkflowState pointer

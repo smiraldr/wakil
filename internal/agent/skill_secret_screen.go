@@ -42,8 +42,8 @@ var secretValuePatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)token\s*[:=]\s*([A-Za-z0-9._\-+/=]{10,})`),
 	// Generic long base64/hex string that looks like a secret (40+ hex chars or 40+ base64 chars on a line by themselves)
 	// This catches pasted API keys that don't have a label.
-	regexp.MustCompile(`(?m)^[A-Fa-f0-9]{40,}$`),           // hex (SHA1, etc.)
-	regexp.MustCompile(`(?m)^[A-Za-z0-9+/]{40,}={0,2}$`),   // base64
+	regexp.MustCompile(`(?m)^[A-Fa-f0-9]{40,}$`),         // hex (SHA1, etc.)
+	regexp.MustCompile(`(?m)^[A-Za-z0-9+/]{40,}={0,2}$`), // base64
 }
 
 // containsSkillSecret reports whether skill content contains what looks

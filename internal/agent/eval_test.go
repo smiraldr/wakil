@@ -292,9 +292,9 @@ func TestEval_TurnBudgetLoopTermination(t *testing.T) {
 
 // TestEval_ReviewRequestContent captures the actual request body sent to the
 // model during /review and verifies:
-//   1. The review rubric constant (reviewRubric) is included verbatim
-//   2. The diff spill path is referenced in the task
-//   3. Exactly one model call was made (no silent extra calls)
+//  1. The review rubric constant (reviewRubric) is included verbatim
+//  2. The diff spill path is referenced in the task
+//  3. Exactly one model call was made (no silent extra calls)
 //
 // What's novel: existing review tests use hard-coded mock JSON and never
 // verify what the model was actually sent. If the rubric is accidentally

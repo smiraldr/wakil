@@ -305,7 +305,7 @@ func TestDedupEditInvalidatesAllPathVariants(t *testing.T) {
 	})
 
 	for _, p := range []string{"a.go", "./a.go", "/work/a.go"} {
-		key := app.toolDedupKey("read_file", `{"path":"` + p + `"}`)
+		key := app.toolDedupKey("read_file", `{"path":"`+p+`"}`)
 		if _, ok := app.ToolCache[key]; ok {
 			t.Errorf("cache entry for path variant %q should be invalidated after edit", p)
 		}

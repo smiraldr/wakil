@@ -101,7 +101,7 @@ func DefaultTools(cwd string) []proxy.Tool {
 			}, "pattern"),
 		}},
 		{Type: "function", Function: proxy.ToolFunction{
-			Name:        "list_dir",
+			Name: "list_dir",
 			Description: "List the entries of a directory (names, with a trailing / on subdirectories). Use this to discover what exists before reading files. " +
 				"Pass include_stats=true to also show file sizes and directory file counts + aggregate sizes (capped at 200 entries, .git/ and node_modules/ excluded from aggregation). " + cwdNote,
 			Parameters: SchemaObj(map[string]interface{}{
@@ -215,7 +215,7 @@ func DefaultTools(cwd string) []proxy.Tool {
 // mathEvalToolDef returns the math_eval tool definition. Shared across all tiers.
 func mathEvalToolDef() proxy.Tool {
 	return proxy.Tool{Type: "function", Function: proxy.ToolFunction{
-		Name:        "math_eval",
+		Name: "math_eval",
 		Description: "Evaluate a mathematical expression and return the result. " +
 			"Supports + - * / % ^, parentheses, and functions: sqrt, pow, abs, floor, ceil, min, max. " +
 			"Constants: pi, e. No variables or assignment. Max 256 characters, max 10 nesting levels. " +

@@ -242,8 +242,10 @@ Rules:
 
 // mergeStopReason picks the highest-priority stop reason from two Send runs
 // (first Send + retry Send). Precedence:
-//   confinement (handled by caller, always wins) > hard_max_shed >
-//   turn_budget_exhausted > iteration_limit.
+//
+//	confinement (handled by caller, always wins) > hard_max_shed >
+//	turn_budget_exhausted > iteration_limit.
+//
 // Empty strings are ignored. When both are the same or one is empty, the
 // non-empty one wins. hard_max_shed (content lost) is strictly worse than
 // turn_budget_exhausted (content stubbed but recoverable), which is worse

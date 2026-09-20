@@ -50,8 +50,8 @@ type dirStatsResult struct {
 	isDir    bool
 	fileSize int64 // for files: byte size; for dirs: 0
 	// For directories only:
-	dirFileCount int   // number of regular files recursively (pruned)
-	dirTotalSize int64 // total size of all regular files recursively
+	dirFileCount  int   // number of regular files recursively (pruned)
+	dirTotalSize  int64 // total size of all regular files recursively
 	dirUnreadable bool  // true if find/stat failed for this directory
 }
 
