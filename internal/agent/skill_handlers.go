@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/treeol/wakil/internal/memory"
 	"github.com/treeol/wakil/internal/proxy"
@@ -79,7 +80,15 @@ func (a *App) handleLoadSkill(ctx context.Context, tc proxy.ToolCall) string {
 	if err != nil {
 		return fmt.Sprintf("ERROR: load skill: %v", err)
 	}
-	return fmt.Sprintf("# skill: %s\n%s\n\n%s", e.Key, renderSkillProvenance(e), e.Value)
+	out := fmt.Sprintf("# skill: %s\n%s\n\n%s", e.Key, renderSkillProvenance(e), e.Value)
+	// Refinement invitation (skill system Part B3): ask the model to propose
+	// an update when it finds the content wrong or outdated. The write itself
+	// always goes through update_skill's interactive confirm gate — this note
+	// only surfaces the option; it never auto-triggers anything.
+	if !a.IsSubagent {
+		out += "\n\n[If you find this skill content is wrong, outdated, or missing something you had to figure out yourself, propose the correction via update_skill with the improved content — the user will review the diff.]"
+	}
+	return out
 }
 
 // handleSkillSearch runs FTS5 search over active skills.
@@ -231,11 +240,16 @@ func (a *App) handleUpdateSkill(ctx context.Context, tc proxy.ToolCall) string {
 	if err := validateSkillValue(value); err != nil {
 		return "ERROR: " + err.Error()
 	}
+	// No-op guard: identical content must not prompt or create a history
+	// version. An update that changes nothing is a model mistake, not work.
+	if value == existingEntry.Value {
+		return fmt.Sprintf("no-op: skill %q already has this exact content — nothing updated", args.Key)
+	}
 	// Secret screening: refuse to persist embedded secrets to the global store.
 	if msg := screenSkillSecrets(value); msg != "" {
 		return "ERROR: " + msg
 	}
-	if !a.Confirm("update_skill", fmt.Sprintf("Update skill %q in the global store (old version kept in history)?", args.Key), fmt.Sprintf("Old: %d bytes\nNew: %d bytes\nTainted: %s\n\nNew content preview:\n%s", len(existingEntry.Value), len(value), taintLabel(a.computeTainted()), previewSkillValue(value)), false) {
+	if !a.Confirm("update_skill", fmt.Sprintf("Update skill %q in the global store (old version kept in history)?", args.Key), fmt.Sprintf("Old: %d bytes\nNew: %d bytes\nTainted: %s\n\nDiff (old → new):\n%s\n\nNew content preview:\n%s", len(existingEntry.Value), len(value), taintLabel(a.computeTainted()), skillLineDiff(existingEntry.Value, value), previewSkillValue(value)), false) {
 		return "[declined by user]"
 	}
 	e, err := s.putActiveSkill(ctx, args.Key, value, a.AgentPrefix, a.chatID(), a.computeTainted(), true, "")
@@ -355,4 +369,124 @@ func taintLabel(tainted int) string {
 	default:
 		return "unknown"
 	}
+}
+
+// skillDiffMaxBytes caps the rendered diff body in the update confirm. When
+// exceeded, the diff is truncated at a rune boundary and a note points at a
+// spilled file holding the FULL proposed content (the preview is only 500
+// bytes, so for large updates the spill is the only complete view).
+const skillDiffMaxBytes = 2000
+
+// skillLineDiff renders a compact line-level diff (old vs new) for the
+// update_skill confirm dialog. Hand-rolled LCS on lines — no external diff
+// dependency. Dangerous invisible characters (controls, bidi overrides) are
+// stripped so terminal renderers cannot be misled; huge single lines are
+// truncated per-line.
+func skillLineDiff(oldVal, newVal string) string {
+	oldLines := diffLines(oldVal)
+	newLines := diffLines(newVal)
+
+	// LCS table. Bounded: diff input is capped by validateSkillValue's 256KiB,
+	// but a pathological all-different case would allocate a huge table, so
+	// guard on line count and fall back to a summary.
+	const maxDiffLines = 2000
+	if len(oldLines) > maxDiffLines || len(newLines) > maxDiffLines {
+		return fmt.Sprintf("(too many lines to diff — old %d lines, new %d lines; byte counts above, full new content in the spilled file if present)", len(oldLines), len(newLines))
+	}
+	lcs := make([][]int, len(oldLines)+1)
+	for i := range lcs {
+		lcs[i] = make([]int, len(newLines)+1)
+	}
+	for i := len(oldLines) - 1; i >= 0; i-- {
+		for j := len(newLines) - 1; j >= 0; j-- {
+			if oldLines[i] == newLines[j] {
+				lcs[i][j] = lcs[i+1][j+1] + 1
+			} else if lcs[i+1][j] >= lcs[i][j+1] {
+				lcs[i][j] = lcs[i+1][j]
+			} else {
+				lcs[i][j] = lcs[i][j+1]
+			}
+		}
+	}
+
+	var b strings.Builder
+	i, j := 0, 0
+	for i < len(oldLines) && j < len(newLines) {
+		switch {
+		case oldLines[i] == newLines[j]:
+			i++
+			j++
+		case lcs[i+1][j] >= lcs[i][j+1]:
+			fmt.Fprintf(&b, "- %s\n", sanitizeDiffLine(oldLines[i]))
+			i++
+		default:
+			fmt.Fprintf(&b, "+ %s\n", sanitizeDiffLine(newLines[j]))
+			j++
+		}
+	}
+	for ; i < len(oldLines); i++ {
+		fmt.Fprintf(&b, "- %s\n", sanitizeDiffLine(oldLines[i]))
+	}
+	for ; j < len(newLines); j++ {
+		fmt.Fprintf(&b, "+ %s\n", sanitizeDiffLine(newLines[j]))
+	}
+
+	out := strings.TrimRight(b.String(), "\n")
+	if out == "" {
+		// No line-level changes after CRLF/trailing-newline normalization —
+		// but the no-op guard does byte equality, so this may still be a
+		// newline-convention-only change. Say so instead of an empty diff.
+		return "(no line-level changes — differs only in line endings/trailing newline; byte counts above are exact)"
+	}
+	if len(out) > skillDiffMaxBytes {
+		// Cut at a rune boundary and note the truncation.
+		cut := out[:skillDiffMaxBytes]
+		for len(cut) > 0 && !utf8.ValidString(cut) {
+			_, size := utf8.DecodeLastRuneInString(cut)
+			if size == 0 {
+				break
+			}
+			cut = cut[:len(cut)-size]
+		}
+		out = cut + "\n… (diff truncated — the full NEW content is in the spilled file if one was written; sizes are exact)"
+	}
+	return out
+}
+
+// diffLines splits s into lines, tolerating CRLF and a missing final newline.
+func diffLines(s string) []string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	lines := strings.Split(s, "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
+}
+
+// sanitizeDiffLine strips characters that can mislead terminal renderers:
+// C0 controls (except tab), DEL, C1 controls, and Unicode bidi overrides
+// (which can make "- old / + new" read backwards). Escaping would be more
+// informative but these should never appear in skill content anyway.
+func sanitizeDiffLine(line string) string {
+	line = strings.Map(func(r rune) rune {
+		if (r < 32 && r != '\t') || r == 0x7F || (r >= 0x80 && r <= 0x9F) ||
+			r == 0x202A || r == 0x202B || r == 0x202C || r == 0x202D || r == 0x202E ||
+			r == 0x2066 || r == 0x2067 || r == 0x2068 || r == 0x2069 {
+			return -1
+		}
+		return r
+	}, line)
+	const maxLine = 200
+	if len(line) > maxLine {
+		cut := line[:maxLine]
+		for len(cut) > 0 && !utf8.ValidString(cut) {
+			_, size := utf8.DecodeLastRuneInString(cut)
+			if size == 0 {
+				break
+			}
+			cut = cut[:len(cut)-size]
+		}
+		line = cut + "…"
+	}
+	return line
 }
