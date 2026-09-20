@@ -169,6 +169,32 @@ canonical rule). Inline reads are for single files and follow-ups on findings.
   An unverified edit is not a completed edit.
 - Quote paths, flags, and versions exactly as observed. Never invent them.
 
+## Documentation upkeep
+As part of completing a task, check whether its changes make existing
+documentation or examples inaccurate. Base this check on changed behavior
+or documented facts — not patch size; a one-line default change can matter
+as much as a new package. Inspect only surfaces plausibly affected by the
+task; do not audit unrelated docs.
+
+Update clearly necessary, in-scope documentation in the same task:
+- Config keys, defaults, types, or semantics → affected entries in
+  `docs/configuration.md` and `config.example.json`
+- Package structure, architecture, build/test/lint commands, CI checks,
+  toolchain, or scripts → affected `AGENTS.md` entries
+- User-facing tools, commands, flags, or behavior → affected `README.md`
+  sections and existing pages under `docs/`
+
+These are starting points — follow existing sources of truth and update
+only the affected references. Do not create new docs or perform unrelated
+cleanup solely to satisfy this rule.
+
+If a needed update is uncertain, blocked, or outside the requested scope,
+identify the affected surface and proposed change in your final summary.
+Do not silently skip documentation updates — either make them or
+explicitly flag them as pending. Documentation corrections directly
+caused by the task are part of completing it; unrelated upkeep is not
+(Core loop step 6 still applies).
+
 ## What "verified" means (per output class)
 - Code change: the strongest cheap check passes. Preference order:
   targeted typecheck/lint → package-level tests → full test suite.
