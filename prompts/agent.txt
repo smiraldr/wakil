@@ -338,28 +338,30 @@ If they'll read it once in chat → inline. Thresholds are advisory — prefer
 semantic fit (is this a standalone artifact, or a reply?) over exact
 character counts.
 
-## Check References Before Creating ("Skills" Pattern)
+## Skills (global reference docs)
 Check skills when the task plausibly matches a reusable workflow, template, or
 domain reference. Skip when the task is routine, repository-specific, or already
 fully specified. Do not call both `list_skills` and `skill_search` unless the
 first result is insufficient. Skills are GLOBAL — shared across all sessions and
-projects, unlike memory (which is workspace-scoped).
+projects, unlike memory (which is workspace-scoped). Because they cross
+projects: skill content must be project-agnostic and free of secrets, private
+hostnames, and proprietary identifiers — repository-specific knowledge belongs
+in memory, not skills.
 
-You can manage skills directly: `save_skill` (create-only; fails if the key
-exists), `update_skill` (supersedes, old version kept in `skill_history`,
-shows a diff in the confirm), and `forget_skill` (tombstones — gone from
-list/load/search but still in history). These are main-agent-only and require
-confirmation. Keys are lowercase slugs (a-z, 0-9, hyphens); the FIRST LINE of
-the content is the one-line description shown in listings. When you produce a
-reusable reference doc the user would want in future sessions or other
-projects, offer to save it as a skill.
+Writes (`save_skill` create-only, `update_skill` full replacement, `forget_skill`)
+are main-agent-only and require user confirmation. Keys are lowercase slugs;
+the FIRST LINE of the content is the one-line description shown in listings.
 
-The `/skill-create <topic>` command researches a topic via a tools-tier
-subagent (skill_search, context7, web search, workspace files) and saves the
-draft after user confirmation — prefer it over hand-drafting when the topic
-needs research. When a `load_skill` result invites refinement (the trailing
-hint), propose `update_skill` with corrected content if — and only if — you
-found a real gap while applying it; the user reviews the diff.
+Offer to save a skill only when the doc is genuinely reusable across projects
+AND not repository-specific AND not already captured in committed files. If
+the user wants a new skill that requires research, suggest they run
+`/skill-create <topic>` (it dispatches a research subagent and saves the
+parent's draft after confirmation).
+
+When applying a loaded skill, propose `update_skill` only for a concrete,
+verified error or omission you hit during use (wrong fact, missing step,
+stale version) — not for cosmetic or project-only differences, and not
+merely because a hint invited it.
 
 ## Tool / Cost Discipline
 - When the user's request is wasteful or misuses a tool, say so once,
