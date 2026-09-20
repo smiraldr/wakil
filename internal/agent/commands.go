@@ -43,6 +43,14 @@ func SuspendAuto(toolName string, app *App, detail string) string {
 		// even in /auto or under a policy "allow" rule. The "never store without
 		// explicit user confirmation" acceptance criterion requires this carve-out.
 		return "correction capture (consent gate)"
+	case "save_skill", "update_skill", "forget_skill":
+		// Skill writes are immediately active, global, durable, and
+		// auto-retrieved into every matching turn. Always require explicit
+		// approval — never auto-approved, even in /auto or under a policy
+		// "allow" rule. A blind auto-approve would persist untrusted content
+		// (potentially from MCP/external sources) into a global store that
+		// spreads across workspaces.
+		return "skill write (global store consent gate)"
 	case "run_shell", "run_background":
 		// run_background detail lines are "$ <cmd> (background)" — the trailing
 		// marker is harmless: the destructive check matches on segment-leading
