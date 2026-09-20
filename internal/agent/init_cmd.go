@@ -6,7 +6,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
+	wtools "github.com/treeol/wakil/internal/tools"
 	"github.com/treeol/wakil/internal/verify"
 )
 
@@ -325,6 +327,33 @@ func handleInitCommand(app *App) (string, error) {
 		summary += " (no project manifests detected — edit the file to add your conventions)"
 	}
 	summary += "\n\nThe file will be included in your system context on the next turn."
+
+	// Build the repo map so the agent has workspace layout context from turn 1.
+	// File-tree always; symbol map when LSP is available.
+	repoCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if treeResult, err := BuildRepoMap(repoCtx, app.Exec); err == nil {
+		spillPath := wtools.SpillToCache(app.chatID(), "repo_map", treeResult.Outline)
+		summary += fmt.Sprintf("\n\nRepo map: %d files in %d directories", treeResult.FileCount, treeResult.DirCount)
+		if spillPath != "" {
+			summary += fmt.Sprintf(" — full outline at: %s", spillPath)
+		}
+	}
+
+	// Symbol map (only when LSP is enabled).
+	if app.LSP != nil {
+		symCtx, symCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer symCancel()
+		if symResult, err := BuildSymbolMap(symCtx, app.Exec, app.LSP, "go"); err == nil && symResult.Completed > 0 {
+			symSpill := wtools.SpillToCache(app.chatID(), "repo_symbols", symResult.Outline)
+			summary += fmt.Sprintf("\nSymbol map (%d symbols from %d files)", symResult.Completed, symResult.Attempted)
+			if symSpill != "" {
+				summary += fmt.Sprintf(" — full outline at: %s", symSpill)
+			}
+		}
+	}
+
 	return summary, nil
 }
 
