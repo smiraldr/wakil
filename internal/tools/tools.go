@@ -61,7 +61,9 @@ func DefaultTools(cwd string) []proxy.Tool {
 		{Type: "function", Function: proxy.ToolFunction{
 			Name: "read_file",
 			Description: "Read a file and return its contents with line numbers. Reads the whole file by default; " +
-				"pass offset/limit to read only a line range (cheaper for large files). " + cwdNote,
+				"pass offset/limit to read only a line range (cheaper for large files). " +
+				"Files that look generated or noisy (minified, very long lines, .git/, node_modules/, vendor/) " +
+				"return a warn-prefixed preview instead of full content — pass limit to override. " + cwdNote,
 			Parameters: SchemaObj(map[string]interface{}{
 				"path":   StrProp("Path to the file to read (relative paths resolve from the working directory)"),
 				"offset": IntProp("Optional 1-based line number to start reading from."),
@@ -235,7 +237,9 @@ func DiscoveryTools(cwd string) []proxy.Tool {
 		{Type: "function", Function: proxy.ToolFunction{
 			Name: "read_file",
 			Description: "Read a file and return its contents with line numbers. Reads the whole file by default; " +
-				"pass offset/limit to read only a line range. " + cwdNote,
+				"pass offset/limit to read only a line range. " +
+				"Files that look generated or noisy (minified, very long lines, .git/, node_modules/, vendor/) " +
+				"return a warn-prefixed preview instead of full content — pass limit to override. " + cwdNote,
 			Parameters: SchemaObj(map[string]interface{}{
 				"path":   StrProp("Path to the file to read."),
 				"offset": IntProp("Optional 1-based line number to start reading from."),
@@ -335,7 +339,9 @@ func EditTools(cwd string) []proxy.Tool {
 		{Type: "function", Function: proxy.ToolFunction{
 			Name: "read_file",
 			Description: "Read a file and return its contents with line numbers. Reads the whole file by default; " +
-				"pass offset/limit to read only a line range. " + cwdNote,
+				"pass offset/limit to read only a line range. " +
+				"Files that look generated or noisy (minified, very long lines, .git/, node_modules/, vendor/) " +
+				"return a warn-prefixed preview instead of full content — pass limit to override. " + cwdNote,
 			Parameters: SchemaObj(map[string]interface{}{
 				"path":   StrProp("Path to the file to read."),
 				"offset": IntProp("Optional 1-based line number to start reading from."),

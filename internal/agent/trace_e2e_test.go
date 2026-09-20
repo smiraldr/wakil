@@ -253,8 +253,9 @@ func TestTraceCappedResult(t *testing.T) {
 	defer srv.Close()
 
 	exe := newFakeExecutor()
-	// 20 000 bytes exceeds the default ToolResultCap of 8 000.
-	exe.files["/work/big.txt"] = strings.Repeat("b", 20000)
+	// 20 000+ bytes exceeds the default ToolResultCap of 8 000.
+	// Use realistic line structure to avoid the smart-read preview heuristic.
+	exe.files["/work/big.txt"] = strings.Repeat("line of text\n", 2000) // ~24K, 2000 lines
 
 	app := newTestApp(srv.URL, exe, func(_, _, _ string, _ bool) bool { return true })
 

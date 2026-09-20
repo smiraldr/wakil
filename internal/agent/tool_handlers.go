@@ -759,6 +759,13 @@ func (a *App) handleReadFile(ctx context.Context, tc proxy.ToolCall) string {
 			"ERROR: binary file, %.2f MB — not readable as text.",
 			float64(len(out))/(1<<20))
 	}
+	// Guard 1c: warn + preview for likely-noisy files when the caller did
+	// not explicitly bound the read with a limit. The heuristic checks
+	// avg/max line length and known VCS/dependency path components. It
+	// never refuses — the model can override with limit or read_file_full.
+	if args.Limit == 0 && isLikelyNoisy(canonical, out) {
+		return filePreview(out)
+	}
 	return formatFileView(out, args.Offset, args.Limit)
 }
 

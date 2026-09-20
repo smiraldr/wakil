@@ -96,7 +96,7 @@ func TestDedupHitWithoutSpillPath(t *testing.T) {
 func TestDedupHitWithSpillPath(t *testing.T) {
 	exec := newFakeExecutor()
 	// Large content that exceeds ToolResultCap to trigger spilling.
-	exec.files["big.go"] = strings.Repeat("x", 20000)
+	exec.files["big.go"] = strings.Repeat("package main\n", 2000) // ~22K, 2000 lines, avoids preview heuristic
 	cfg := config.DefaultConfig()
 	cfg.ToolResultCap = 1000
 	app := &App{
@@ -470,7 +470,7 @@ func TestDedupEntryHasNoSpillPathWhenRawTools(t *testing.T) {
 func TestDedupHitWithSpillPathRecoverable(t *testing.T) {
 	exec := newFakeExecutor()
 	// Large content that exceeds ToolResultCap to trigger spilling.
-	exec.files["big.go"] = strings.Repeat("x", 20000)
+	exec.files["big.go"] = strings.Repeat("package main\n", 2000) // ~22K, 2000 lines, avoids preview heuristic
 	cfg := config.DefaultConfig()
 	cfg.ToolResultCap = 1000
 	app := &App{
@@ -520,7 +520,7 @@ func TestDedupHitWithSpillPathRecoverable(t *testing.T) {
 	if len(content) < 20000 {
 		t.Errorf("spill file content length = %d, want >= 20000", len(content))
 	}
-	if !strings.Contains(content, "x") {
+	if !strings.Contains(content, "package main") {
 		t.Error("spill file content should contain the original data")
 	}
 }
