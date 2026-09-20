@@ -176,6 +176,10 @@ func (a *App) handleSaveSkill(ctx context.Context, tc proxy.ToolCall) string {
 	if err := validateSkillValue(value); err != nil {
 		return "ERROR: " + err.Error()
 	}
+	// Secret screening: refuse to persist embedded secrets to the global store.
+	if msg := screenSkillSecrets(value); msg != "" {
+		return "ERROR: " + msg
+	}
 	if !a.Confirm("save_skill", fmt.Sprintf("Save new skill %q to the global store?", args.Key), fmt.Sprintf("Size: %d bytes\nTainted: %s\n\nContent preview:\n%s", len(value), taintLabel(a.computeTainted()), previewSkillValue(value)), false) {
 		return "[declined by user]"
 	}
@@ -226,6 +230,10 @@ func (a *App) handleUpdateSkill(ctx context.Context, tc proxy.ToolCall) string {
 	}
 	if err := validateSkillValue(value); err != nil {
 		return "ERROR: " + err.Error()
+	}
+	// Secret screening: refuse to persist embedded secrets to the global store.
+	if msg := screenSkillSecrets(value); msg != "" {
+		return "ERROR: " + msg
 	}
 	if !a.Confirm("update_skill", fmt.Sprintf("Update skill %q in the global store (old version kept in history)?", args.Key), fmt.Sprintf("Old: %d bytes\nNew: %d bytes\nTainted: %s\n\nNew content preview:\n%s", len(existingEntry.Value), len(value), taintLabel(a.computeTainted()), previewSkillValue(value)), false) {
 		return "[declined by user]"
