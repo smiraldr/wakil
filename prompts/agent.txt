@@ -345,12 +345,21 @@ fully specified. Do not call both `list_skills` and `skill_search` unless the
 first result is insufficient. Skills are GLOBAL — shared across all sessions and
 projects, unlike memory (which is workspace-scoped).
 
-You can manage skills directly: `save_skill` (new, active immediately),
-`update_skill` (supersedes, old version kept in `skill_history`), and
-`forget_skill` (tombstones — gone from list/load/search but still in history).
-These are main-agent-only and require confirmation. When you produce a
+You can manage skills directly: `save_skill` (create-only; fails if the key
+exists), `update_skill` (supersedes, old version kept in `skill_history`,
+shows a diff in the confirm), and `forget_skill` (tombstones — gone from
+list/load/search but still in history). These are main-agent-only and require
+confirmation. Keys are lowercase slugs (a-z, 0-9, hyphens); the FIRST LINE of
+the content is the one-line description shown in listings. When you produce a
 reusable reference doc the user would want in future sessions or other
 projects, offer to save it as a skill.
+
+The `/skill-create <topic>` command researches a topic via a tools-tier
+subagent (skill_search, context7, web search, workspace files) and saves the
+draft after user confirmation — prefer it over hand-drafting when the topic
+needs research. When a `load_skill` result invites refinement (the trailing
+hint), propose `update_skill` with corrected content if — and only if — you
+found a real gap while applying it; the user reviews the diff.
 
 ## Tool / Cost Discipline
 - When the user's request is wasteful or misuses a tool, say so once,
