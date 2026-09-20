@@ -112,6 +112,7 @@ reference covering every section below.
 | `oracle_enabled` | `false` | Gate for `mashura__*` counsel tools |
 | `oracle_model` | `"claude-sonnet-4-6"` | Model ID for counsel calls |
 | `oracle_api_key_env` | `"ANTHROPIC_API_KEY"` | Env var read at call time for the API key |
+| `mashura_fallback_model` | `""` | Explicitly prefixed fallback model (e.g. `"openrouter:anthropic/claude-sonnet-4"`) used when no `default` panel is configured. If empty, auto-detects based on which API key is set. Must include provider prefix. |
 | `lsp_enabled` | `false` | Gate for `lsp_*` code-intelligence tools |
 | `lsp_servers` | — | Maps language → server command |
 | `browser_enabled` | `false` | Gate for `browser_*` headless-browser tools (chromedp + Chromium) |
