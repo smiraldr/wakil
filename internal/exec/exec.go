@@ -332,7 +332,7 @@ const systemPath = "/usr/local/go/bin:/usr/local/go-workspace/bin" +
 func sandboxHomeArgs(sandboxHome string, uid, gid int) []string {
 	return []string{
 		"--user", fmt.Sprintf("%d:%d", uid, gid),
-		"-v", sandboxHome+":/home/user:z",
+		"-v", sandboxHome + ":/home/user:z",
 		// H3: tmpfs overlay shadows the persistent bind mount at the
 		// two executable bin dirs. 64m is generous for tool binaries.
 		"--tmpfs", "/home/user/go/bin:rw,nosuid,nodev,size=64m",

@@ -24,8 +24,8 @@ import (
 
 type fakeExec struct{}
 
-func (fakeExec) RunShell(context.Context, string) (string, error)          { return "", nil }
-func (fakeExec) ReadFile(context.Context, string) (string, error)          { return "", nil }
+func (fakeExec) RunShell(context.Context, string) (string, error) { return "", nil }
+func (fakeExec) ReadFile(context.Context, string) (string, error) { return "", nil }
 func (fakeExec) ReadFileBounded(context.Context, string, int64) (string, bool, error) {
 	return "", false, nil
 }

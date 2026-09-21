@@ -16,8 +16,8 @@ import (
 // AddPendingImage + ReplacePendingImages + SendOutcome consume do not race.
 func TestPendingImages_ConcurrentAccess(t *testing.T) {
 	app := &App{
-		Cfg:  config.DefaultConfig(),
-		Out:  io.Discard,
+		Cfg: config.DefaultConfig(),
+		Out: io.Discard,
 	}
 
 	var wg sync.WaitGroup
@@ -78,8 +78,8 @@ func TestPendingImages_ConcurrentAccess(t *testing.T) {
 // is locked — concurrent AddPendingImage while consuming should not race.
 func TestPendingImages_SendOutcomeConsume(t *testing.T) {
 	app := &App{
-		Cfg:  config.DefaultConfig(),
-		Out:  io.Discard,
+		Cfg: config.DefaultConfig(),
+		Out: io.Discard,
 	}
 
 	// Pre-populate with some images.

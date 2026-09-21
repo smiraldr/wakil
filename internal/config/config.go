@@ -155,7 +155,7 @@ type Config struct {
 	// increases host-kernel attack surface and bypasses seccomp for ring ops.
 	// Docker-only; ignored in direct mode. No CLI flag or env var (config-file only,
 	// matching DockerCaps/DockerMemory/DockerPidsLimit/DockerTmpfsSize).
-	DockerIOUring bool   `json:"docker_io_uring,omitempty"`
+	DockerIOUring bool `json:"docker_io_uring,omitempty"`
 	// DockerStartTimeoutSec bounds the docker run command in the constructor
 	// (container creation). Default 120s — generous because SELinux :z
 	// relabeling of large mount points can take minutes on first run.
@@ -166,8 +166,8 @@ type Config struct {
 	// is separate from this host-side deadline; this value must exceed 10s to
 	// avoid killing the CLI before the graceful window expires. Minimum 15s.
 	// Default 30s per command. 0 = use default (30s).
-	DockerStopTimeoutSec int `json:"docker_stop_timeout_sec,omitempty"`
-	SSHSigning    string `json:"ssh_signing,omitempty"` // SSH commit signing in the sandbox: "off" (default) | "auto" (detect from host git config) | path to a .pub key
+	DockerStopTimeoutSec int    `json:"docker_stop_timeout_sec,omitempty"`
+	SSHSigning           string `json:"ssh_signing,omitempty"` // SSH commit signing in the sandbox: "off" (default) | "auto" (detect from host git config) | path to a .pub key
 
 	// ShellTimeoutSec is the soft deadline in seconds after which a blocking
 	// run_shell command is auto-backgrounded. Under the deadline: blocking,
