@@ -29,7 +29,6 @@ package agent
 //     machinery doesn't contaminate its own fingerprints.
 
 import (
-	"fmt"
 	"strings"
 )
 
@@ -207,7 +206,3 @@ func formatSkillSequence(seq []string) string {
 	return strings.Join(seq, " → ")
 }
 
-// skillSuggestionDebugSummary returns a one-line state summary for tests.
-func (s *skillSuggestionState) skillSuggestionDebugSummary() string {
-	return fmt.Sprintf("current=%d history=%d hints=%d", len(s.current), len(s.history), s.hintsUsed)
-}
