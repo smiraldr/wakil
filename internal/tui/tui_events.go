@@ -259,6 +259,15 @@ func (m tuiModel) handleEventMsg(msg tea.Msg, cmds []tea.Cmd) (tuiModel, []tea.C
 			m.facade.AddPendingImage(lm.Img)
 			chip := lm.Img.Placeholder()
 			*m.imageChips = append(*m.imageChips, chip)
+			// If garbage fragments leaked through the suppression window
+			// while the clipboard read was in flight, they're sitting in
+			// the textarea. Clear them before inserting the chip so the
+			// user sees a clean placeholder, not hieroglyphs + chip.
+			if idx := binaryPasteStart(m.ta.Value()); idx >= 0 {
+				keep := strings.TrimRight(m.ta.Value()[:idx], " ")
+				m.ta.SetValue(keep)
+				m.ta.CursorEnd()
+			}
 			m.ta.InsertString(chip + " ")
 		}
 		m.refreshViewport()

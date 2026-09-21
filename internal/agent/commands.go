@@ -709,12 +709,15 @@ func HandleTUICommand(line string, app *App) (handled, quit bool, cmd Cmd) {
 
 	case "/image":
 		if len(fields) < 2 {
-			if len(app.PendingImages) > 0 {
-				labels := make([]string, len(app.PendingImages))
-				for i, img := range app.PendingImages {
+			app.stateMu.RLock()
+			images := app.PendingImages
+			app.stateMu.RUnlock()
+			if len(images) > 0 {
+				labels := make([]string, len(images))
+				for i, img := range images {
 					labels[i] = img.Placeholder()
 				}
-				return true, false, note(fmt.Sprintf("%d image(s) queued:\n  %s", len(app.PendingImages), strings.Join(labels, "\n  ")))
+				return true, false, note(fmt.Sprintf("%d image(s) queued:\n  %s", len(images), strings.Join(labels, "\n  ")))
 			}
 			return true, false, note("usage: /image <path> [path2 ...] | /image clipboard — attach image(s) to your next message")
 		}
@@ -734,7 +737,7 @@ func HandleTUICommand(line string, app *App) (handled, quit bool, cmd Cmd) {
 				errs = append(errs, err.Error())
 				continue
 			}
-			app.PendingImages = append(app.PendingImages, img)
+			app.AddPendingImage(img) // H8: route through locked App method
 			attached++
 		}
 		msg := fmt.Sprintf("attached %d image(s) — will be sent with your next message", attached)

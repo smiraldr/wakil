@@ -997,10 +997,15 @@ func (a *App) SendOutcome(ctx context.Context, userText string) (_ TurnOutcome, 
 	a.fitConvToWindow(ctx)
 
 	userMsg := proxy.Message{Role: "user", Content: StrPtr(stored), Pinned: a.pinUserMessage}
+	// H8: consume PendingImages under stateMu — the TUI /image handler and
+	// clipboardImageMsg write via App.AddPendingImage (stateMu-guarded).
+	// Swap (not read-then-nil) so no concurrent append is lost.
+	a.stateMu.Lock()
 	if len(a.PendingImages) > 0 {
 		userMsg.Images = a.PendingImages
-		a.PendingImages = nil // consume
+		a.PendingImages = nil
 	}
+	a.stateMu.Unlock()
 	a.convMu.Lock()
 	a.Conv = append(a.Conv, userMsg)
 	a.convMu.Unlock()

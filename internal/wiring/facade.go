@@ -533,27 +533,27 @@ func (f *wiringFacade) SetCtxLimit(lim sessionclient.ContextLimit) {
 }
 
 func (f *wiringFacade) SetModelList(models []string) {
-	f.app.ModelList = append([]string(nil), models...)
+	f.app.SetModelList(models) // H8: route through locked App method
 	f.bumpVersion()
 }
 
 func (f *wiringFacade) SetTools(tools []proxy.Tool) {
-	f.app.Tools = append([]proxy.Tool(nil), tools...)
+	f.app.SetTools(tools) // H8: route through locked App method
 	f.bumpVersion()
 }
 
 func (f *wiringFacade) ReplacePendingImages(imgs []proxy.ImagePart) {
-	f.app.PendingImages = append([]proxy.ImagePart(nil), imgs...)
+	f.app.ReplacePendingImages(imgs) // H8: route through locked App method
 	f.bumpVersion()
 }
 
 func (f *wiringFacade) AddPendingImage(img proxy.ImagePart) {
-	f.app.PendingImages = append(f.app.PendingImages, img)
+	f.app.AddPendingImage(img) // H8: route through locked App method
 	f.bumpVersion()
 }
 
 func (f *wiringFacade) ClearPendingImages() {
-	f.app.PendingImages = nil
+	f.app.ClearPendingImages() // H8: route through locked App method
 	f.bumpVersion()
 }
 

@@ -2,7 +2,9 @@ package tui
 
 import (
 	"context"
+	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -12,26 +14,39 @@ import (
 	"github.com/treeol/wakil/internal/proxy"
 )
 
-// readClipboardImageBytes runs a clipboard backend command on the host and
-// returns its stdout as raw bytes. The command must output clipboard image
-// data to stdout when an image is available, and exit non-zero (or produce
-// non-image output) when the clipboard holds no image.
-//
-// Backends are tried in order: wl-paste (Wayland), xclip (X11), pbpaste (macOS).
+// readClipboardImageBytes reads image data from the system clipboard. It
+// selects the appropriate backend by environment rather than trying all
+// three serially (3s timeout each = 9s worst case on a hung backend).
+// WAYLAND_DISPLAY → wl-paste, DISPLAY → xclip, darwin → pbpaste.
+// Falls back to serial probing if no display variable is set.
 //
 // A 3s timeout bounds each backend — xclip -o can block indefinitely when the
 // selection owner is unresponsive. The timeout ensures readClipboardCmd always
 // returns a clipboardImageMsg, preventing pasteReadInFlight from wedging the
 // keyboard indefinitely.
 func readClipboardImageBytes() ([]byte, error) {
-	backends := []clipboardBackend{
-		{"wl-paste", []string{"-t", "image/png"}},
-		{"xclip", []string{"-selection", "clipboard", "-t", "image/png", "-o"}},
-		{"pbpaste", []string{"-Prefer", "png"}},
+	// Fast path: pick the right backend by environment — avoids trying
+	// backends that aren't relevant (and may hang) on the current display
+	// server.
+	if os.Getenv("WAYLAND_DISPLAY") != "" {
+		if data, err := (clipboardBackend{"wl-paste", []string{"-t", "image/png"}}).run(); err == nil && len(data) > 0 {
+			return data, nil
+		}
 	}
-	for _, b := range backends {
-		data, err := b.run()
-		if err == nil && len(data) > 0 {
+	if os.Getenv("DISPLAY") != "" {
+		if data, err := (clipboardBackend{"xclip", []string{"-selection", "clipboard", "-t", "image/png", "-o"}}).run(); err == nil && len(data) > 0 {
+			return data, nil
+		}
+	}
+	if runtime.GOOS == "darwin" {
+		if data, err := (clipboardBackend{"pbpaste", []string{"-Prefer", "png"}}).run(); err == nil && len(data) > 0 {
+			return data, nil
+		}
+	}
+	// Fallback: try all backends serially (for environments without standard
+	// display variables, e.g. SSH-forwarded X11 or unusual setups).
+	for _, b := range clipboardBackends {
+		if data, err := b.run(); err == nil && len(data) > 0 {
 			return data, nil
 		}
 	}
@@ -42,6 +57,14 @@ func readClipboardImageBytes() ([]byte, error) {
 type clipboardBackend struct {
 	cmd  string
 	args []string
+}
+
+// clipboardBackends is the fallback list used when no display environment
+// variable is set. Ordered by likelihood: Wayland, X11, macOS.
+var clipboardBackends = []clipboardBackend{
+	{"wl-paste", []string{"-t", "image/png"}},
+	{"xclip", []string{"-selection", "clipboard", "-t", "image/png", "-o"}},
+	{"pbpaste", []string{"-Prefer", "png"}},
 }
 
 // clipboardReadTimeout bounds each backend command. If the clipboard owner
@@ -225,7 +248,24 @@ func binaryPasteStart(s string) int {
 
 	sig := signatureStart(s)
 	if sig < 0 {
-		return nulIdx // possibly -1
+		if nulIdx >= 0 {
+			return nulIdx
+		}
+		// No signature and no NUL: the paste may still be binary if the
+		// terminal stripped all non-UTF-8 bytes (bubbletea drops RuneError,
+		// so only ASCII survives) and the image format lacks a recognized
+		// ASCII scaffold (e.g. JPEG without JFIF/Exif, BMP, TIFF). Use a
+		// signature-independent garbage heuristic: the surviving printable
+		// chars from compressed image data are symbol-dense and space-
+		// starved. Require BOTH discriminators (higher confidence without
+		// a signature) and a longer threshold (256 vs 96). The stash-and-
+		// restore fallback bounds the cost of a false positive.
+		if len(runes) >= binaryTailMinRunesNoSig {
+			if symbolRatio(runes) >= binaryTailSymbolRatioNoSig && spaceRatio(runes) <= binaryTailMaxSpaceRatioNoSig {
+				return 0
+			}
+		}
+		return -1
 	}
 	if nulIdx >= 0 {
 		if nulIdx < sig {
@@ -260,6 +300,22 @@ func binaryPasteStart(s string) int {
 	}
 	return -1
 }
+
+// binaryTailMinRunesNoSig is the minimum content length for the signature-
+// independent garbage heuristic. Higher than binaryTailMinRunes (96) because
+// without a signature there's less confidence; 256 is enough for compressed
+// image data to produce a clear symbol/space signal.
+const binaryTailMinRunesNoSig = 256
+
+// binaryTailSymbolRatioNoSig is the symbol-ratio threshold for the no-signature
+// path. Higher than the with-signature threshold (0.09) because both
+// discriminators must pass, and we need stronger evidence without a signature.
+const binaryTailSymbolRatioNoSig = 0.12
+
+// binaryTailMaxSpaceRatioNoSig is the space-ratio ceiling for the no-signature
+// path. Same as the with-signature threshold — space scarcity is the stronger
+// signal and doesn't need tightening.
+const binaryTailMaxSpaceRatioNoSig = 0.02
 
 // binaryTailMinRunes is the minimum content length after a signature hit for
 // the garbage-tail confirmation to apply. Real image pastes are KBs even
