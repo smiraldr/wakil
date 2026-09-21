@@ -205,4 +205,3 @@ func (a *App) appendSkillHint(tcName string, ok bool, text string) string {
 func formatSkillSequence(seq []string) string {
 	return strings.Join(seq, " → ")
 }
-
