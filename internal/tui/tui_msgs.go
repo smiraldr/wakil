@@ -21,6 +21,13 @@ type armTickMsg struct{ seq int }
 // m.pasteBurstSeq, so a stale tick from a superseded burst is a no-op.
 type pasteBurstTickMsg struct{ seq int }
 
+// pasteIdleTickMsg is the catch-all binary-paste scanner: fires 400ms after
+// the last key event whenever the textarea is non-empty. It runs
+// binaryPasteStart over the FULL textarea content regardless of how the
+// paste arrived (bracketed, fragmented, or otherwise) — closing the gap
+// where mangled image bytes sat in the input until the user pressed Enter.
+type pasteIdleTickMsg struct{}
+
 // restorePasteStashMsg fires after a failed clipboard read once the paste
 // tail has drained, to restore the cut text into the textarea. Re-arms
 // itself while the suppression window is still open (tail still arriving).

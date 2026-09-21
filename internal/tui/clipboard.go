@@ -302,15 +302,18 @@ func binaryPasteStart(s string) int {
 }
 
 // binaryTailMinRunesNoSig is the minimum content length for the signature-
-// independent garbage heuristic. Higher than binaryTailMinRunes (96) because
-// without a signature there's less confidence; 256 is enough for compressed
-// image data to produce a clear symbol/space signal.
-const binaryTailMinRunesNoSig = 256
+// independent garbage heuristic. Same as the with-signature threshold (96)
+// because compressed image data produces a clear symbol/space signal even
+// at that length — and requiring more would miss smaller images whose
+// signatures were stripped by terminal sanitization.
+const binaryTailMinRunesNoSig = 96
 
 // binaryTailSymbolRatioNoSig is the symbol-ratio threshold for the no-signature
-// path. Higher than the with-signature threshold (0.09) because both
-// discriminators must pass, and we need stronger evidence without a signature.
-const binaryTailSymbolRatioNoSig = 0.12
+// path. Uniform printable ASCII (what survives when the terminal strips
+// non-UTF-8 bytes) has symbolRatio ≈ 0.116; prose is 2-5%. 0.10 sits below
+// the uniform-ASCII floor and above prose, so binary garbage matches but
+// typed text never does.
+const binaryTailSymbolRatioNoSig = 0.10
 
 // binaryTailMaxSpaceRatioNoSig is the space-ratio ceiling for the no-signature
 // path. Same as the with-signature threshold — space scarcity is the stronger

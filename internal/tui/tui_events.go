@@ -99,6 +99,30 @@ func (m tuiModel) handleEventMsg(msg tea.Msg, cmds []tea.Cmd) (tuiModel, []tea.C
 			m = m.reflowIfStatusHeightChanged(before)
 		}
 		return m, cmds, true
+	case pasteIdleTickMsg:
+		// Catch-all binary-paste scanner: 400ms after the last keystroke,
+		// check the FULL textarea content for mangled image data — whatever
+		// path the paste arrived through. Re-arms itself while text remains.
+		m.pasteIdleScanArmed = false
+		if m.pasteReadInFlight || m.ta.Value() == "" {
+			return m, cmds, true
+		}
+		if idx := binaryPasteStart(m.ta.Value()); idx >= 0 {
+			all := []rune(m.ta.Value())
+			keep := strings.TrimRight(string(all[:idx]), " ")
+			m.pasteCutStash = string(all[idx:]) // restored if clipboard read fails
+			m.ta.SetValue(keep)
+			m.ta.CursorEnd()
+			m.pasteReadInFlight = true
+			m.pasteReadInFlightDeadline = time.Now().Add(pasteReadInFlightTimeout)
+			m.pasteSuppressUntil = time.Now().Add(pasteSuppressWindow)
+			m.comp = computeCompletion(m.ta, m.compSources(), m.fetchSessionShortIDs)
+			m.addItem(iSys, dim2("· binary paste detected: reading image from clipboard…"))
+			m.refreshViewport()
+			m = m.reflow()
+			return m, append(cmds, readClipboardCmd()), true
+		}
+		return m, cmds, true
 	case pasteBurstTickMsg:
 		// Collapse a fragmented paste burst into a placeholder, but only if
 		// this tick belongs to the current burst, the burst has actually gone

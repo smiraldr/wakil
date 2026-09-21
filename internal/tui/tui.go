@@ -98,6 +98,12 @@ const subTabAutoCloseDelay = 30 * time.Second
 // swallowed event extends the window, so a long paste tail stays covered.
 const pasteSuppressWindow = 150 * time.Millisecond
 
+// pasteIdleScanGap is the idle delay before the catch-all binary-paste
+// scanner runs on the full textarea content. Short (100ms): the paste lands
+// essentially instantly, so the garbage is visible for at most a blink
+// before the scanner cuts it and the chip replaces it.
+const pasteIdleScanGap = 100 * time.Millisecond
+
 // pasteReadInFlightTimeout is the maximum time pasteReadInFlight can stay
 // true. If the clipboardImageMsg doesn't arrive within this duration (e.g.
 // the clipboard backend hangs), the flag is force-cleared in the key
@@ -361,6 +367,10 @@ type tuiModel struct {
 	// regenerated with the updated line count. Empty when no burst has
 	// been collapsed yet.
 	pasteBurstPh string
+
+	// pasteIdleScanArmed guards the idle binary-paste scan (pasteIdleTickMsg):
+	// only one tick is in flight at a time; re-armed after each firing.
+	pasteIdleScanArmed bool
 
 	// pasteStash maps collapsed-paste placeholders to their original full text.
 	// When a large text paste arrives (bracketed paste, non-binary), the full
@@ -834,6 +844,32 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m = m.reflowIfStatusHeightChanged(before)
 			return m, tea.Batch(append(cmds, readClipboardCmd())...)
 		}
+		// H8: bracketed paste that containsBinary missed — try the
+		// position-independent binaryPasteStart on the paste content. This
+		// catches pastes whose signatures were stripped by terminal
+		// sanitization (containsBinary is position-anchored and misses them;
+		// binaryPasteStart is position-independent).
+		if msg.Paste && msg.Type == tea.KeyRunes && !containsBinary(msg.Runes) {
+			if idx := binaryPasteStart(string(msg.Runes)); idx >= 0 {
+				r := msg.Runes
+				m.pasteCutStash = string(r[idx:])
+				keep := strings.TrimRight(string(r[:idx]), " ")
+				if keep != "" {
+					m.ta.SetValue(keep)
+					m.ta.CursorEnd()
+				} else {
+					m.ta.Reset()
+				}
+				m.pasteReadInFlight = true
+				m.pasteReadInFlightDeadline = time.Now().Add(pasteReadInFlightTimeout)
+				m.pasteSuppressUntil = time.Now().Add(pasteSuppressWindow)
+				m.comp = computeCompletion(m.ta, m.compSources(), m.fetchSessionShortIDs)
+				m.addItem(iSys, dim2("· binary paste detected: reading image from clipboard…"))
+				m.refreshViewport()
+				m = m.reflowIfStatusHeightChanged(before)
+				return m, tea.Batch(append(cmds, readClipboardCmd())...)
+			}
+		}
 
 		// Large-text-paste collapse: a bracketed paste (Paste=true) that is
 		// NOT binary but IS multi-line (≥ pasteCollapseMinLines lines) is
@@ -990,6 +1026,16 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m = m.reflowIfStatusHeightChanged(before)
 		m, vpCmd = m.updateViewport(msg)
 		cmds = append(cmds, taCmd, vpCmd)
+		// H8 paste UX: arm the idle binary-paste scanner whenever the
+		// textarea holds text — whatever path the paste arrived through,
+		// 400ms after the last keystroke the scanner checks the FULL
+		// content and cuts garbage + reads the clipboard if it matches.
+		if m.ta.Value() != "" && !m.pasteReadInFlight && !m.pasteIdleScanArmed {
+			m.pasteIdleScanArmed = true
+			cmds = append(cmds, tea.Tick(pasteIdleScanGap, func(time.Time) tea.Msg {
+				return pasteIdleTickMsg{}
+			}))
+		}
 		return m, tea.Batch(cmds...)
 
 	default:
