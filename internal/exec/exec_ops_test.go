@@ -660,3 +660,27 @@ func TestDockerIsProcessAliveScript(t *testing.T) {
 		}
 	})
 }
+
+// TestStartBackground_O_EXCL_FailsOnExistingLog verifies that
+// DirectExecutor.StartBackground uses O_EXCL — it fails when the log file
+// already exists instead of silently truncating someone else's log (H6).
+func TestStartBackground_O_EXCL_FailsOnExistingLog(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "existing.log")
+	if err := os.WriteFile(logPath, []byte("someone-elses-log"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	exe := &DirectExecutor{}
+	_, _, err := exe.StartBackground(context.Background(), "true", logPath)
+	if err == nil {
+		t.Fatal("StartBackground should fail when the log file already exists (O_EXCL)")
+	}
+	// The existing file must NOT be truncated.
+	content, readErr := os.ReadFile(logPath)
+	if readErr != nil {
+		t.Fatalf("cannot read log: %v", readErr)
+	}
+	if string(content) != "someone-elses-log" {
+		t.Errorf("existing log was modified (O_EXCL should prevent this): %q", content)
+	}
+}

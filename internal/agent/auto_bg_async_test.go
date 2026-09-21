@@ -334,6 +334,106 @@ func TestAutoBG_TabDoneEmittedOnNaturalExit(t *testing.T) {
 	app.bgMu.Unlock()
 }
 
+// TestAutoBG_ReaperDeletesEntryOnNaturalExit verifies that the reaper removes
+// the bgProcs entry after a natural process exit (H7: map stays bounded).
+func TestAutoBG_ReaperDeletesEntryOnNaturalExit(t *testing.T) {
+	exe, err := exec.NewDirectExecutor(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer exe.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.ShellTimeoutSec = 1
+	app := &App{
+		Exec:    exe,
+		Out:     io.Discard,
+		Confirm: func(_, _, _ string, _ bool) bool { return true },
+		Cfg:     cfg,
+	}
+
+	bgID := startAutoBGShell(t, app, "sleep 3")
+
+	// Verify entry exists while process is running.
+	app.bgMu.RLock()
+	_, exists := app.bgProcs[bgID]
+	app.bgMu.RUnlock()
+	if !exists {
+		t.Fatal("bgProcs entry should exist while process is running")
+	}
+
+	// Wait for the process to exit and the reaper to clean up.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		app.bgMu.RLock()
+		_, exists := app.bgProcs[bgID]
+		app.bgMu.RUnlock()
+		if !exists {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	app.bgMu.RLock()
+	_, exists = app.bgProcs[bgID]
+	app.bgMu.RUnlock()
+	if exists {
+		t.Error("bgProcs entry should be deleted by reaper after natural exit (H7: map growth)")
+	}
+}
+
+// TestRunBackground_ReaperDeletesEntryOnNaturalExit verifies the run_background
+// reaper also removes the entry after natural exit (H7).
+func TestRunBackground_ReaperDeletesEntryOnNaturalExit(t *testing.T) {
+	exe, err := exec.NewDirectExecutor(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer exe.Close()
+
+	app := &App{
+		Exec:    exe,
+		Out:     io.Discard,
+		Confirm: func(_, _, _ string, _ bool) bool { return true },
+		Cfg:     config.DefaultConfig(),
+	}
+
+	res := app.handleToolCall(context.Background(), proxy.ToolCall{Function: proxy.FunctionCall{
+		Name: "run_background", Arguments: `{"command":"sleep 1","label":"test"}`,
+	}})
+	if !strings.Contains(res.text, "id: bg") {
+		t.Fatalf("expected bg id, got: %s", res.text)
+	}
+
+	// Extract bgID.
+	bgID := "bg1"
+	for _, line := range strings.Split(res.text, "\n") {
+		if strings.HasPrefix(line, "id: ") {
+			bgID = strings.TrimSpace(strings.TrimPrefix(line, "id: "))
+			break
+		}
+	}
+
+	// Wait for the process to exit and the reaper to clean up.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		app.bgMu.RLock()
+		_, exists := app.bgProcs[bgID]
+		app.bgMu.RUnlock()
+		if !exists {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	app.bgMu.RLock()
+	_, exists := app.bgProcs[bgID]
+	app.bgMu.RUnlock()
+	if exists {
+		t.Error("bgProcs entry should be deleted by reaper after natural exit (H7: map growth)")
+	}
+}
+
 // TestPublishBgCompletion_NoDoubleClose verifies that publishBgCompletion
 // and cancelBgAsyncOp cannot both close op.done (finding 3).
 // This is a unit test for the helper functions directly.

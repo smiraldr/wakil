@@ -163,8 +163,9 @@ func shQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-// randSuffix returns n hex characters of randomness for unique-naming purposes
-// (container names, etc.). Uses crypto/rand so the result is not predictable.
+// randSuffix returns 2*n hex characters of randomness (n random bytes, hex-encoded)
+// for unique-naming purposes (container names, etc.). Uses crypto/rand so the result
+// is not predictable. e.g. randSuffix(6) returns 12 hex chars.
 func randSuffix(n int) string {
 	b := make([]byte, n)
 	_, _ = crand.Read(b)

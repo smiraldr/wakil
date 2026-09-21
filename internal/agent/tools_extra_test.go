@@ -477,7 +477,10 @@ func TestSIGKILLEscalation(t *testing.T) {
 		t.Errorf("expected ~5 s TERM→KILL escalation, took %s", elapsed)
 	}
 	// bgProcs entry must be cleaned up after kill.
-	if _, ok := app.bgProcs[bgID]; ok {
+	app.bgMu.RLock()
+	_, ok := app.bgProcs[bgID]
+	app.bgMu.RUnlock()
+	if ok {
 		t.Error("bgProcs entry must be deleted after kill_process")
 	}
 	// Verify the process group is truly gone via the executor.

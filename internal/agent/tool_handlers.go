@@ -129,7 +129,7 @@ func (a *App) runShellWithDeadline(ctx context.Context, command string, readActi
 	// mode /tmp is also writable. A host-side os.MkdirTemp would create a
 	// directory that doesn't exist inside the container, causing the
 	// redirect to fail.
-	logPath := fmt.Sprintf("/tmp/wakil-bg-%d.log", n)
+	logPath := a.bgLogPath(n)
 	bgID := fmt.Sprintf("bg%d", n)
 
 	pid, pgid, err := a.Exec.StartBackground(ctx, exec.WrapExitMarker(command, logPath), logPath)
@@ -180,6 +180,8 @@ func (a *App) runShellWithDeadline(ctx context.Context, command string, readActi
 	// AND a notification.
 	safe.Go("auto-bg-reaper", func() {
 		bgCtx := context.Background()
+		reaperStart := time.Now()
+		const reaperMaxPoll = 24 * time.Hour
 		for {
 			if !a.Exec.IsProcessGroupAlive(bgCtx, pgid) {
 				close(done)
@@ -225,6 +227,22 @@ func (a *App) runShellWithDeadline(ctx context.Context, command string, readActi
 					statusLine, tail := a.shellTailPreview(entry)
 					a.announceShellDone(bgID, entry, statusLine+"\n"+tail, "")
 				}
+				// H7: Remove the entry from the registry on natural exit.
+				// IDs are monotonic (bgCounter never rolls back), so deleting
+				// by bgID is safe — the entry can never be a re-used slot.
+				a.bgMu.Lock()
+				delete(a.bgProcs, bgID)
+				a.bgMu.Unlock()
+				return
+			}
+			// H7: Bound the reaper — a stuck process group (or an
+			// IsProcessGroupAlive bug that never returns false) must not
+			// leak the goroutine forever. After 24h, abandon the entry.
+			if time.Since(reaperStart) >= reaperMaxPoll {
+				close(done)
+				a.bgMu.Lock()
+				delete(a.bgProcs, bgID)
+				a.bgMu.Unlock()
 				return
 			}
 			time.Sleep(200 * time.Millisecond)
@@ -1266,7 +1284,7 @@ func (a *App) handleRunBackground(ctx context.Context, tc proxy.ToolCall) string
 	// creates the file directly — no directory creation needed. A host-side
 	// os.MkdirTemp would create a directory that doesn't exist inside the
 	// container, causing the redirect to fail silently.
-	logPath := fmt.Sprintf("/tmp/wakil-bg-%d.log", n)
+	logPath := a.bgLogPath(n)
 	bgID := fmt.Sprintf("bg%d", n)
 	detail := fmt.Sprintf("$ %s (background)\n  label=%s, log=%s\n  (%s)",
 		args.Command, args.Label, logPath, a.Exec.Describe())
@@ -1326,6 +1344,8 @@ func (a *App) handleRunBackground(ctx context.Context, tc proxy.ToolCall) string
 	// inbox so a suspended turn resumes — zero polling, zero wasted tokens.
 	safe.Go("bg-reaper", func() {
 		bgCtx := context.Background()
+		reaperStart := time.Now()
+		const reaperMaxPoll = 24 * time.Hour
 		for {
 			if !a.Exec.IsProcessGroupAlive(bgCtx, pgid) {
 				close(done)
@@ -1345,6 +1365,18 @@ func (a *App) handleRunBackground(ctx context.Context, tc proxy.ToolCall) string
 					a.publishBgCompletion(op, bgID, entry, statusLine, tail)
 				}
 				a.announceShellDone(bgID, entry, statusLine+"\n"+tail, "")
+				// H7: Remove the entry from the registry on natural exit.
+				a.bgMu.Lock()
+				delete(a.bgProcs, bgID)
+				a.bgMu.Unlock()
+				return
+			}
+			// H7: Bound the reaper — 24h max, then abandon the entry.
+			if time.Since(reaperStart) >= reaperMaxPoll {
+				close(done)
+				a.bgMu.Lock()
+				delete(a.bgProcs, bgID)
+				a.bgMu.Unlock()
 				return
 			}
 			time.Sleep(200 * time.Millisecond)
