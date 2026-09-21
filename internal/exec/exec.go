@@ -316,6 +316,34 @@ func waitForKVR(socketPath string, timeout time.Duration) error {
 	return fmt.Errorf("kvr did not become ready within %s", timeout)
 }
 
+// systemPath is the in-container PATH for the sandbox, with user bin dirs
+// prepended to the system PATH baked into the Dockerfile.
+const systemPath = "/usr/local/go/bin:/usr/local/go-workspace/bin" +
+	":/usr/local/cargo/bin" +
+	":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+// sandboxHomeArgs builds the docker args for the sandbox-home bind mount.
+// Extracted from NewDockerExecutor for testability (H3).
+//
+// H3: --tmpfs overlays on go/bin and .cargo/bin shadow the persistent bind
+// mount at those executable dirs. Installed binaries (go install, cargo
+// install) work within the session but do not persist into the next one.
+// Cache dirs (go/pkg/mod, .cargo/registry) persist via the bind mount.
+func sandboxHomeArgs(sandboxHome string, uid, gid int) []string {
+	return []string{
+		"--user", fmt.Sprintf("%d:%d", uid, gid),
+		"-v", sandboxHome+":/home/user:z",
+		// H3: tmpfs overlay shadows the persistent bind mount at the
+		// two executable bin dirs. 64m is generous for tool binaries.
+		"--tmpfs", "/home/user/go/bin:rw,nosuid,nodev,size=64m",
+		"--tmpfs", "/home/user/.cargo/bin:rw,nosuid,nodev,size=64m",
+		"-e", "HOME=/home/user",
+		"-e", "GOPATH=/home/user/go",
+		"-e", "CARGO_HOME=/home/user/.cargo",
+		"-e", "PATH=/home/user/go/bin:/home/user/.cargo/bin:" + systemPath,
+	}
+}
+
 // defaultDockerTmpfsSize is the /tmp tmpfs size used when DockerTmpfsSize is
 // unset. /tmp must stay writable under --read-only, so the flag is always
 // emitted — empty never means "omit". Must be coherent with DockerMemory
@@ -708,23 +736,19 @@ func NewDockerExecutor(opts DockerOpts) (*DockerExecutor, error) {
 	// Run as the current host user so files written to the mounted workspace
 	// are owned correctly. A persistent directory on the host serves as HOME
 	// so Go/Cargo module caches survive across sessions.
+	//
+	// H3: sandbox-home persistence hole. The bind mount makes go/bin and
+	// .cargo/bin persistent and PATH-first, so a shim dropped there in one
+	// session shadows system binaries in every future session and project.
+	// Fix: tmpfs overlay on those two executable dirs — they become ephemeral
+	// (container-lifetime), while cache dirs (go/pkg/mod, .cargo/registry)
+	// persist via the bind mount. A shim installed in session A does not
+	// survive into session B.
 	if uid := os.Getuid(); uid > 0 {
 		if hostHome, err := os.UserHomeDir(); err == nil {
 			sandboxHome := filepath.Join(hostHome, ".wakil", "sandbox-home")
 			if os.MkdirAll(sandboxHome, 0o700) == nil {
-				// PATH must be set explicitly: we prepend user bin dirs to the
-				// system PATH baked into the image by the Dockerfile.
-				const systemPath = "/usr/local/go/bin:/usr/local/go-workspace/bin" +
-					":/usr/local/cargo/bin" +
-					":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-				args = append(args,
-					"--user", fmt.Sprintf("%d:%d", uid, os.Getgid()),
-					"-v", sandboxHome+":/home/user:z",
-					"-e", "HOME=/home/user",
-					"-e", "GOPATH=/home/user/go",
-					"-e", "CARGO_HOME=/home/user/.cargo",
-					"-e", "PATH=/home/user/go/bin:/home/user/.cargo/bin:"+systemPath,
-				)
+				args = append(args, sandboxHomeArgs(sandboxHome, uid, os.Getgid())...)
 			}
 		}
 	}
