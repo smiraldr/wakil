@@ -203,6 +203,8 @@ type DockerExecutor struct {
 	// seccompProfilePath is the host path to the temporary seccomp profile
 	// file, if one was created. Cleaned up in Close().
 	seccompProfilePath string
+	// stopTimeoutSec is the per-command teardown deadline (H5). 0 = default 30s.
+	stopTimeoutSec int
 }
 
 // dockerSocketPath is the host docker socket bind-mounted into the sandbox when
@@ -251,6 +253,10 @@ type DockerOpts struct {
 	// (127.0.0.1::9222) for the host-side browser manager to connect to
 	// chromium running inside the container. When false, no port is published.
 	BrowserEnabled bool
+	// DockerStartTimeout bounds the docker run command. Default 120s.
+	DockerStartTimeout int // seconds; 0 = default
+	// DockerStopTimeout bounds each teardown command (stop, rm). Default 30s.
+	DockerStopTimeout int // seconds; 0 = default
 }
 
 // waitForKVR polls the kvr UDS socket with PING until it responds or the
@@ -432,6 +438,54 @@ func selinuxDockerSocketHint() string {
 		"  sudo ausearch -m avc -ts recent | grep connectto | audit2allow -M wakil_dockersock\n" +
 		"  sudo semodule -i wakil_dockersock.pp\n" +
 		"Or run wakil with --exec direct on SELinux hosts."
+}
+
+// dockerCmd runs a docker CLI command with a bounded context. It replaces bare
+// exec.Command calls in the Docker lifecycle (constructor, Close, post-start
+// helpers) with a deadline + WaitDelay + actionable error on timeout. Returns
+// combined output, whether the deadline was exceeded, and the error.
+//
+// The timeout is per-command — callers must use fresh contexts for independent
+// commands (e.g. stop and rm in Close must NOT share a context, so a slow stop
+// cannot starve rm). WaitDelay (2s) ensures the command's Wait() does not hang
+// past the deadline if a child process holds the stdout pipe.
+//
+// On deadline: the error message names the operation and suggests checking the
+// daemon, so the user sees "docker run timed out (120s) — is the Docker daemon
+// responsive? Check: docker ps" instead of "signal: killed".
+func dockerCmd(timeout time.Duration, args ...string) (out string, timedOut bool, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd.WaitDelay = 2 * time.Second
+	raw, runErr := cmd.CombinedOutput()
+	out = string(raw)
+	if ctx.Err() == context.DeadlineExceeded {
+		op := args[0]
+		if len(args) > 1 {
+			op += " " + args[1]
+		}
+		return out, true, fmt.Errorf("docker %s timed out (%s) — is the Docker daemon responsive? Check: docker ps", op, timeout)
+	}
+	return out, false, runErr
+}
+
+// dockerCmdRun is like dockerCmd but uses Run() instead of CombinedOutput —
+// for commands where output is not needed (e.g. docker rm -f in cleanup paths).
+func dockerCmdRun(timeout time.Duration, args ...string) (timedOut bool, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd.WaitDelay = 2 * time.Second
+	runErr := cmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		op := args[0]
+		if len(args) > 1 {
+			op += " " + args[1]
+		}
+		return true, fmt.Errorf("docker %s timed out (%s) — is the Docker daemon responsive? Check: docker ps", op, timeout)
+	}
+	return false, runErr
 }
 
 // dockerPreflight checks that the Docker CLI binary exists and the daemon is
@@ -685,12 +739,29 @@ func NewDockerExecutor(opts DockerOpts) (*DockerExecutor, error) {
 		args = append(args, image, "sleep", "infinity")
 	}
 
-	out, err := exec.Command("docker", args...).CombinedOutput()
-	if err != nil {
+	startTimeout := opts.DockerStartTimeout
+	if startTimeout <= 0 {
+		startTimeout = 120
+	}
+	out, timedOut, err := dockerCmd(time.Duration(startTimeout)*time.Second, args...)
+	if timedOut || err != nil {
+		if timedOut {
+			// The container may or may not have been created — attempt
+			// cleanup with the generated name so the user is not left
+			// with a zombie container.
+			_, rmErr := dockerCmdRun(15*time.Second, "rm", "-f", name)
+			if cleanupProfile != nil {
+				cleanupProfile()
+			}
+			if rmErr != nil {
+				return nil, fmt.Errorf("%w (container name: %s — manual cleanup: docker rm -f %s)", err, name, name)
+			}
+			return nil, err
+		}
 		if cleanupProfile != nil {
 			cleanupProfile()
 		}
-		msg := strings.TrimSpace(string(out))
+		msg := strings.TrimSpace(out)
 		if msg == "" {
 			return nil, fmt.Errorf("docker run failed: %w", err)
 		}
@@ -701,6 +772,7 @@ func NewDockerExecutor(opts DockerOpts) (*DockerExecutor, error) {
 		dockerSock: dockerSock, signing: opts.Signing.Enabled, generation: 1,
 		stagingMount: opts.StagingMount, iouring: opts.DockerIOUring,
 		seccompProfilePath: opts.IOUringProfilePath,
+		stopTimeoutSec:     opts.DockerStopTimeout,
 	}
 
 	// Container health check: docker run -d returns success even if the
@@ -708,8 +780,8 @@ func NewDockerExecutor(opts DockerOpts) (*DockerExecutor, error) {
 	// the container has already exited, surface the logs and return an error
 	// — every subsequent command would fail against a dead container.
 	if exited, logs := checkContainerExited(name); exited {
-		if err := exec.Command("docker", "rm", "-f", name).Run(); err != nil {
-			log.Printf("docker rm -f %s (after early exit): %v", name, err)
+		if _, rmErr := dockerCmdRun(15*time.Second, "rm", "-f", name); rmErr != nil {
+			log.Printf("docker rm -f %s (after early exit): %v", name, rmErr)
 		}
 		if cleanupProfile != nil {
 			cleanupProfile()
@@ -730,7 +802,9 @@ func NewDockerExecutor(opts DockerOpts) (*DockerExecutor, error) {
 		// workdir. It can't remediate (rootfs is read-only), but the warning
 		// surfaces the problem early — every subsequent command would fail
 		// with a cd error anyway.
-		out, err := d.execCtx(context.Background(), false, "sh", "-c", "mkdir -p "+shQuote(workdir))
+		mkdirCtx, mkdirCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer mkdirCancel()
+		out, err := d.execCtx(mkdirCtx, false, "sh", "-c", "mkdir -p "+shQuote(workdir))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: mkdir workdir %s: %s: %v\n", workdir, strings.TrimSpace(out), err)
 		}
@@ -744,8 +818,8 @@ func NewDockerExecutor(opts DockerOpts) (*DockerExecutor, error) {
 	if uid := os.Getuid(); uid > 0 {
 		if err := ensurePasswdEntry(name, uid, os.Getgid()); err != nil {
 			if opts.Signing.Enabled {
-				if err := exec.Command("docker", "rm", "-f", name).Run(); err != nil {
-					log.Printf("docker rm -f %s (passwd setup fail): %v", name, err)
+				if _, rmErr := dockerCmdRun(15*time.Second, "rm", "-f", name); rmErr != nil {
+					log.Printf("docker rm -f %s (passwd setup fail): %v", name, rmErr)
 				}
 				if cleanupProfile != nil {
 					cleanupProfile()
@@ -863,25 +937,25 @@ func NewDockerExecutor(opts DockerOpts) (*DockerExecutor, error) {
 // exit immediately if the entrypoint script is missing, kvr-server crashes, or
 // the image is broken.
 func checkContainerExited(name string) (exited bool, logs string) {
-	out, err := exec.Command("docker", "inspect",
-		"--format", "{{.State.Status}}", name).CombinedOutput()
+	out, _, err := dockerCmd(10*time.Second, "inspect",
+		"--format", "{{.State.Status}}", name)
 	if err != nil {
 		return false, "" // inspect failed — can't determine state, proceed
 	}
-	status := strings.TrimSpace(string(out))
+	status := strings.TrimSpace(out)
 	if status != "exited" && status != "dead" {
 		return false, ""
 	}
 	// Container has exited — fetch logs to help diagnose.
-	logOut, _ := exec.Command("docker", "logs", "--tail", "20", name).CombinedOutput()
-	return true, strings.TrimSpace(string(logOut))
+	logOut, _, _ := dockerCmd(10*time.Second, "logs", "--tail", "20", name)
+	return true, strings.TrimSpace(logOut)
 }
 
 // getContainerLogs returns the last `lines` lines from the container's stdout/
 // stderr. Used for diagnostics when kvr-server or other container processes
 // fail to start.
 func getContainerLogs(name string, lines int) string {
-	out, err := exec.Command("docker", "logs", "--tail", fmt.Sprint(lines), name).CombinedOutput()
+	out, _, err := dockerCmd(10*time.Second, "logs", "--tail", fmt.Sprint(lines), name)
 	if err != nil {
 		return ""
 	}
@@ -892,12 +966,12 @@ func getContainerLogs(name string, lines int) string {
 // container's published CDP port (9222). Returns 0 if the port couldn't be
 // resolved.
 func resolveCDPPort(container string) int {
-	out, err := exec.Command("docker", "port", container, "9223").CombinedOutput()
+	out, _, err := dockerCmd(5*time.Second, "port", container, "9223")
 	if err != nil {
 		return 0
 	}
 	// Output format: "0.0.0.0:32768\n" or "127.0.0.1:32768\n"
-	s := strings.TrimSpace(string(out))
+	s := strings.TrimSpace(out)
 	// Extract the port number after the last colon.
 	idx := strings.LastIndex(s, ":")
 	if idx < 0 || idx == len(s)-1 {
@@ -920,9 +994,9 @@ func ensurePasswdEntry(container string, uid, gid int) error {
 	script := fmt.Sprintf(
 		"getent passwd %d >/dev/null 2>&1 || echo 'user:x:%d:%d:sandbox user:/home/user:/bin/sh' >> /etc/passwd",
 		uid, uid, gid)
-	out, err := exec.Command("docker", "exec", "-u", "0", container, "sh", "-c", script).CombinedOutput()
+	out, _, err := dockerCmd(10*time.Second, "exec", "-u", "0", container, "sh", "-c", script)
 	if err != nil {
-		return fmt.Errorf("ensurePasswdEntry: %s: %w", strings.TrimSpace(string(out)), err)
+		return fmt.Errorf("ensurePasswdEntry: %s: %w", strings.TrimSpace(out), err)
 	}
 	return nil
 }
@@ -970,9 +1044,9 @@ func restoreEtcBackups(container string) error {
 		"  mkdir -p /etc/alternatives && " +
 		"  cp -a /usr/local/share/wakil-etc-backup/alternatives/. /etc/alternatives/; " +
 		"fi"
-	out, err := exec.Command("docker", "exec", "-u", "0", container, "sh", "-c", script).CombinedOutput()
+	out, _, err := dockerCmd(10*time.Second, "exec", "-u", "0", container, "sh", "-c", script)
 	if err != nil {
-		return fmt.Errorf("restoreEtcBackups: %s: %w", strings.TrimSpace(string(out)), err)
+		return fmt.Errorf("restoreEtcBackups: %s: %w", strings.TrimSpace(out), err)
 	}
 	return nil
 }
@@ -1000,14 +1074,14 @@ func ensureDockerCLI(container string) error {
 	// output won't be "yes", so we fall through to docker cp below — the
 	// error from the existence check itself is intentionally ignored because
 	// the fall-through path handles it.
-	out, _ := exec.Command("docker", "exec", container, "sh", "-c",
-		"command -v docker >/dev/null 2>&1 && echo yes").Output()
-	if strings.TrimSpace(string(out)) == "yes" {
+	out, _, _ := dockerCmd(10*time.Second, "exec", container, "sh", "-c",
+		"command -v docker >/dev/null 2>&1 && echo yes")
+	if strings.TrimSpace(out) == "yes" {
 		return nil
 	}
-	out, err = exec.Command("docker", "cp", hostBin, container+":/usr/local/bin/docker").CombinedOutput()
+	out, _, err = dockerCmd(10*time.Second, "cp", hostBin, container+":/usr/local/bin/docker")
 	if err != nil {
-		return fmt.Errorf("ensureDockerCLI: docker cp: %s: %w", strings.TrimSpace(string(out)), err)
+		return fmt.Errorf("ensureDockerCLI: docker cp: %s: %w", strings.TrimSpace(out), err)
 	}
 	return nil
 }
@@ -1183,6 +1257,17 @@ func (d *DockerExecutor) KVRSocketPath() string { return d.kvrSocket }
 func (d *DockerExecutor) KVRAvailable() bool    { return d.kvrAvailable }
 func (d *DockerExecutor) ContainerName() string { return d.container }
 func (d *DockerExecutor) CDPPort() int          { return d.cdpPort }
+
+// stopTimeout returns the per-command teardown deadline in seconds (H5).
+// Enforces a minimum of 15s — the docker stop -t 10 grace period needs the
+// host-side deadline to exceed it, otherwise the CLI is killed before kvr
+// finishes its snapshot.
+func (d *DockerExecutor) stopTimeout() int {
+	if d.stopTimeoutSec >= 15 {
+		return d.stopTimeoutSec
+	}
+	return 30
+}
 func (d *DockerExecutor) Describe() string {
 	sock := ""
 	if d.dockerSock {
@@ -1213,15 +1298,25 @@ func (d *DockerExecutor) Close() error {
 	// ceiling, docker stop returns when PID 1 exits. If stop fails (e.g.
 	// container already exited), the kvr graceful snapshot window is lost,
 	// but rm -f below is still attempted to clean up the container.
-	if err := exec.Command("docker", "stop", "-t", "10", d.container).Run(); err != nil {
+	//
+	// H5: Each teardown command gets its own bounded context — a slow stop
+	// cannot starve rm (fresh deadline per command). The host-side deadline
+	// must exceed the docker stop -t grace (10s) so the CLI is not killed
+	// before the graceful window expires. Default 30s = 10s grace + 20s slack.
+	stopTimeout := time.Duration(d.stopTimeout()) * time.Second
+	if _, err := dockerCmdRun(stopTimeout, "stop", "-t", "10", d.container); err != nil {
 		log.Printf("docker stop %s (Close): %v", d.container, err)
 	}
-	err := exec.Command("docker", "rm", "-f", d.container).Run()
+	rmTimeout := time.Duration(d.stopTimeout()) * time.Second
+	_, rmErr := dockerCmdRun(rmTimeout, "rm", "-f", d.container)
 	// Clean up the seccomp profile temp file if one was created.
 	if d.seccompProfilePath != "" {
 		_ = os.Remove(d.seccompProfilePath)
 	}
-	return err
+	if rmErr != nil {
+		return fmt.Errorf("docker rm -f %s (Close): %w (manual cleanup: docker rm -f %s)", d.container, rmErr, d.container)
+	}
+	return nil
 }
 
 // StartInteractive spawns a long-running process inside the container with

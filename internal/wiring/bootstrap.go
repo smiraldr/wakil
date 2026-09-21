@@ -419,6 +419,8 @@ func NewExecutor(cfg config.Config) (exec.Executor, error) {
 			DockerTmpfsSize:         cfg.DockerTmpfsSize,
 			DockerIOUring:           cfg.DockerIOUring,
 			BrowserEnabled:          cfg.BrowserEnabled,
+			DockerStartTimeout:      cfg.DockerStartTimeoutSec,
+			DockerStopTimeout:       cfg.DockerStopTimeoutSec,
 		})
 	}
 }
